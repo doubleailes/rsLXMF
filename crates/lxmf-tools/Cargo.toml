@@ -1,0 +1,28 @@
+[package]
+name = "lxmf-tools"
+description = "Rust LXMF daemon and CLI tools for Reticulum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+autobins = false
+
+[dependencies]
+lxmf-core = { workspace = true }
+rns-runtime = { workspace = true, features = ["serial"] }
+rns-identity = { workspace = true }
+rns-transport = { workspace = true }
+rns-wire = { workspace = true }
+rns-crypto = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+serde_json = { workspace = true }
+rmpv = { workspace = true }
+
+[[bin]]
+name = "lxmd-rs"
+path = "src/bin/lxmd-rs.rs"
