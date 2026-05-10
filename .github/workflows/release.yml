@@ -17,6 +17,7 @@ env:
   RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
   PACKAGE_ROOT: rsLXMF
   LXMF_BINS: lxmd-rs
+  RSLXMF_RSRETICULUM_REF: v0.9.3-autoif.1
 
 jobs:
   build:
@@ -46,7 +47,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/rsReticulum
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.RSLXMF_RSRETICULUM_REF }}
           path: rsReticulum
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
