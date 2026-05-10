@@ -17,7 +17,7 @@ env:
   RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
   PACKAGE_ROOT: rsLXMF
   LXMF_BINS: lxmd-rs
-  RSLXMF_RSRETICULUM_REF: v0.9.3-autoif.1
+  RSLXMF_RSRETICULUM_REF: v0.9.3
 
 jobs:
   build:
@@ -108,5 +108,5 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          prerelease: true
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           files: release-assets/*
