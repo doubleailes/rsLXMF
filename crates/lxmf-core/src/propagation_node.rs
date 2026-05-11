@@ -18,8 +18,8 @@ use crate::sync::{OfferResponse, SyncGet, SyncOffer, SyncSession};
 pub struct PropagationNodeConfig {
     pub max_storage: usize,
     pub max_message_age: u64,
-    /// Messages below this stamp value are rejected. Matches Python
-    /// `propagation_stamp_cost` (production default PROPAGATION_COST = 16).
+    /// Messages below this effective stamp value are rejected. Python derives
+    /// this from `propagation_stamp_cost - propagation_stamp_cost_flexibility`.
     pub min_stamp_cost: u8,
     pub peering_cost: u8,
     pub max_message_size: usize,
@@ -168,6 +168,9 @@ impl PropagationNode {
     /// destination client during `/get`.
     pub fn accept_propagated_blob(&mut self, lxmf_data: &[u8], stamp_value: u8) -> bool {
         if lxmf_data.len() < DESTINATION_LENGTH + 1 {
+            return false;
+        }
+        if self.config.min_stamp_cost > 0 && stamp_value < self.config.min_stamp_cost {
             return false;
         }
 
@@ -1622,6 +1625,24 @@ mod tests {
         assert_eq!(messages[0].as_slice().unwrap(), lxmf_data.as_slice());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_accept_propagated_blob_enforces_min_stamp_cost() {
+        let config = PropagationNodeConfig {
+            min_stamp_cost: 8,
+            ..Default::default()
+        };
+        let mut node = PropagationNode::new(config, [0xAA; 16]);
+
+        let mut lxmf_data = vec![0xBB; 16];
+        lxmf_data.extend_from_slice(&[0xCC; 128]);
+
+        assert!(!node.accept_propagated_blob(&lxmf_data, 7));
+        assert_eq!(node.message_count(), 0);
+
+        assert!(node.accept_propagated_blob(&lxmf_data, 8));
+        assert_eq!(node.message_count(), 1);
     }
 
     #[test]

@@ -404,7 +404,9 @@ impl LxmdRunner {
                     .unwrap_or(config.propagation_limit_kb * 1024),
                 max_message_size: config.propagation_limit_kb * 1024,
                 max_message_age: lxmf_core::constants::MESSAGE_EXPIRY,
-                min_stamp_cost: config.propagation_stamp_cost,
+                min_stamp_cost: config
+                    .propagation_stamp_cost
+                    .saturating_sub(config.propagation_stamp_flex),
                 ..Default::default()
             };
             let prop_storage_path = paths.propagation_store_dir.clone();
@@ -423,7 +425,9 @@ impl LxmdRunner {
                                 .unwrap_or(config.propagation_limit_kb * 1024),
                             max_message_size: config.propagation_limit_kb * 1024,
                             max_message_age: lxmf_core::constants::MESSAGE_EXPIRY,
-                            min_stamp_cost: config.propagation_stamp_cost,
+                            min_stamp_cost: config
+                                .propagation_stamp_cost
+                                .saturating_sub(config.propagation_stamp_flex),
                             ..Default::default()
                         },
                         propagation_dest_hash,
@@ -1244,7 +1248,7 @@ impl LxmdRunner {
         let min_cost = self
             .config
             .propagation_stamp_cost
-            .saturating_sub(lxmf_core::constants::PROPAGATION_COST_FLEX);
+            .saturating_sub(self.config.propagation_stamp_flex);
         let mut accepted = 0usize;
         let mut rejected = 0usize;
 
