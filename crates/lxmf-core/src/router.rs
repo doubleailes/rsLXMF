@@ -108,7 +108,7 @@ pub struct DeferredStampJob {
 
 #[derive(Debug)]
 pub enum SendError {
-    MissingOutboundPropagationNode(LxMessage),
+    MissingOutboundPropagationNode(Box<LxMessage>),
 }
 
 impl SendError {
@@ -263,7 +263,7 @@ impl LxmRouter {
             } else {
                 message.notify_failed();
             }
-            return Err(SendError::MissingOutboundPropagationNode(message));
+            return Err(SendError::MissingOutboundPropagationNode(Box::new(message)));
         }
 
         let now = now_f64();
