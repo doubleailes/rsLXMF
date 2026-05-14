@@ -50,7 +50,13 @@ impl PropagationEntry {
         size: usize,
         stamp_value: u8,
     ) -> Self {
-        let mut entry = Self::new(transient_id, message_hash, destination_hash, size, stamp_value);
+        let mut entry = Self::new(
+            transient_id,
+            message_hash,
+            destination_hash,
+            size,
+            stamp_value,
+        );
         entry.stamped = true;
         entry
     }
@@ -302,9 +308,7 @@ impl PropagationStore {
             .push_back((transient_id, from_peer));
     }
 
-    pub fn drain_distribution_queue(
-        &mut self,
-    ) -> Vec<(PropagationTransientId, Option<[u8; 16]>)> {
+    pub fn drain_distribution_queue(&mut self) -> Vec<(PropagationTransientId, Option<[u8; 16]>)> {
         self.peer_distribution_queue.drain(..).collect()
     }
 
@@ -373,9 +377,9 @@ mod tests {
             stamped: false,
         };
         let fname = entry.filename();
-        assert!(fname.starts_with(
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
+        assert!(
+            fname.starts_with("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         let parts: Vec<&str> = fname.split('_').collect();
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[2], "8");

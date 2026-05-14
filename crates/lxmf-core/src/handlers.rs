@@ -334,6 +334,7 @@ pub enum ControlResult {
 /// `/offer`, `/get`) to [`crate::propagation_node::PropagationNode`]. Python reference:
 /// LXMRouter.py:650-657.
 pub struct PropagationRequestHandler {
+    pub local_identity_hash: [u8; 16],
     pub control_allowed: Vec<[u8; 16]>,
     /// When true, only peers in [`static_peers`](Self::static_peers) may submit offers.
     pub from_static_only: bool,
@@ -346,6 +347,7 @@ impl PropagationRequestHandler {
     /// Create a handler seeded with the local identity hash, which is always control-allowed.
     pub fn new(identity_hash: [u8; 16]) -> Self {
         Self {
+            local_identity_hash: identity_hash,
             control_allowed: vec![identity_hash],
             from_static_only: false,
             static_peers: std::collections::HashSet::new(),
@@ -413,6 +415,7 @@ impl PropagationRequestHandler {
             identity_known,
             is_throttled,
             access_allowed,
+            Some(&self.local_identity_hash),
             remote_identity_hash,
         )
     }
@@ -915,16 +918,37 @@ mod tests {
 
     #[test]
     fn test_offer_request_handler_success() {
-        let handler = PropagationRequestHandler::new([0xAA; 16]);
+        let local_identity = [0xAA; 16];
+        let peer_hash = [0xCC; 16];
+        let cost = 8;
+        let handler = PropagationRequestHandler::new(local_identity);
         let mut node = crate::propagation_node::PropagationNode::new(
-            crate::propagation_node::PropagationNodeConfig::default(),
+            crate::propagation_node::PropagationNodeConfig {
+                peering_cost: cost,
+                ..Default::default()
+            },
             [0xBB; 16],
         );
-        let peer_hash = [0xCC; 16];
+
+        let peering_key = {
+            let mut peering_id = Vec::with_capacity(32);
+            peering_id.extend_from_slice(&local_identity);
+            peering_id.extend_from_slice(&peer_hash);
+            crate::stamper::generate_stamp_raw(
+                &peering_id,
+                cost,
+                crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
+            )
+            .unwrap()
+            .0
+        };
 
         let offer_data = {
             use rmpv::Value;
-            let arr = Value::Array(vec![Value::Binary(vec![]), Value::Array(vec![])]);
+            let arr = Value::Array(vec![
+                Value::Binary(peering_key.to_vec()),
+                Value::Array(vec![]),
+            ]);
             let mut buf = Vec::new();
             rmpv::encode::write_value(&mut buf, &arr).unwrap();
             buf

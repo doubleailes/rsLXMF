@@ -534,6 +534,7 @@ impl PropagationNode {
         identity_known: bool,
         is_throttled: bool,
         access_allowed: bool,
+        local_identity_hash: Option<&[u8; 16]>,
         remote_identity_hash: Option<&[u8; 16]>,
     ) -> Vec<u8> {
         let now = std::time::SystemTime::now()
@@ -553,16 +554,17 @@ impl PropagationNode {
             }
         };
 
-        // peering_id = self.dest_hash || remote_identity_hash. Empty key means
-        // peering-cost enforcement is disabled.
+        // Python validates peering_id = local_identity.hash || remote_identity.hash.
         let peering_key_valid = if peering_key.is_empty() {
-            true
+            self.config.peering_cost == 0
         } else if peering_key.len() == 32 {
-            if let Some(remote_hash) = remote_identity_hash {
+            if let (Some(local_hash), Some(remote_hash)) =
+                (local_identity_hash, remote_identity_hash)
+            {
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&peering_key);
                 let mut peering_id = Vec::with_capacity(32);
-                peering_id.extend_from_slice(&self.dest_hash);
+                peering_id.extend_from_slice(local_hash);
                 peering_id.extend_from_slice(remote_hash);
                 crate::stamper::validate_peering_key(&peering_id, &key, self.config.peering_cost)
             } else {
@@ -910,6 +912,19 @@ mod tests {
         vec![byte; 32]
     }
 
+    fn peering_key(local_identity: &[u8; 16], remote_identity: &[u8; 16], cost: u8) -> [u8; 32] {
+        let mut peering_id = Vec::with_capacity(32);
+        peering_id.extend_from_slice(local_identity);
+        peering_id.extend_from_slice(remote_identity);
+        crate::stamper::generate_stamp_raw(
+            &peering_id,
+            cost,
+            crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
+        )
+        .unwrap()
+        .0
+    }
+
     #[test]
     fn test_new_propagation_node() {
         let node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
@@ -1041,9 +1056,12 @@ mod tests {
         lxmf_data.extend_from_slice(&[0xCC; 64]);
         std::fs::write(dir.join(old_filename), &lxmf_data).unwrap();
 
-        let node =
-            PropagationNode::with_storage(PropagationNodeConfig::default(), [0xAA; 16], dir.clone())
-                .unwrap();
+        let node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.clone(),
+        )
+        .unwrap();
         assert_eq!(node.message_count(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1502,8 +1520,14 @@ mod tests {
         let stored_tid = msg.transient_id.unwrap();
         node.accept_message(&msg);
 
-        let resp =
-            node.offer_request_checked([0xDD; 16], true, false, true, true, &[stored_tid, tid(0x99)]);
+        let resp = node.offer_request_checked(
+            [0xDD; 16],
+            true,
+            false,
+            true,
+            true,
+            &[stored_tid, tid(0x99)],
+        );
         match resp {
             OfferResponse::WantSome(ids) => {
                 assert_eq!(ids.len(), 1);
@@ -1544,23 +1568,95 @@ mod tests {
 
     #[test]
     fn test_handle_offer_request_valid() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let cost = 8;
+        let local_identity = [0xAA; 16];
+        let remote_identity = [0xBB; 16];
+        let config = PropagationNodeConfig {
+            peering_cost: cost,
+            ..Default::default()
+        };
+        let mut node = PropagationNode::new(config, [0xCC; 16]);
+        let key = peering_key(&local_identity, &remote_identity, cost);
 
-        // Empty peering key disables peering-cost enforcement.
         use rmpv::Value;
         let offer = Value::Array(vec![
-            Value::Binary(vec![]),
-            Value::Array(vec![
-                Value::Binary(id(0x11)),
-                Value::Binary(id(0x22)),
-            ]),
+            Value::Binary(key.to_vec()),
+            Value::Array(vec![Value::Binary(id(0x11)), Value::Binary(id(0x22))]),
         ]);
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &offer).unwrap();
 
-        let response_bytes = node.handle_offer_request(&buf, [0xBB; 16], true, false, true, None);
+        let response_bytes = node.handle_offer_request(
+            &buf,
+            [0xDD; 16],
+            true,
+            false,
+            true,
+            Some(&local_identity),
+            Some(&remote_identity),
+        );
         let response = OfferResponse::from_msgpack(&response_bytes);
         assert_eq!(response, OfferResponse::WantAll);
+    }
+
+    #[test]
+    fn test_handle_offer_request_rejects_empty_peering_key_when_cost_required() {
+        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let local_identity = [0xAA; 16];
+        let remote_identity = [0xBB; 16];
+
+        use rmpv::Value;
+        let offer = Value::Array(vec![
+            Value::Binary(vec![]),
+            Value::Array(vec![Value::Binary(id(0x11))]),
+        ]);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &offer).unwrap();
+
+        let response_bytes = node.handle_offer_request(
+            &buf,
+            [0xDD; 16],
+            true,
+            false,
+            true,
+            Some(&local_identity),
+            Some(&remote_identity),
+        );
+        let response = OfferResponse::from_msgpack(&response_bytes);
+        assert_eq!(response, OfferResponse::ErrorInvalidKey);
+    }
+
+    #[test]
+    fn test_handle_offer_request_rejects_wrong_peering_identity_order() {
+        let cost = 8;
+        let local_identity = [0xAA; 16];
+        let remote_identity = [0xBB; 16];
+        let config = PropagationNodeConfig {
+            peering_cost: cost,
+            ..Default::default()
+        };
+        let mut node = PropagationNode::new(config, [0xCC; 16]);
+        let key = peering_key(&remote_identity, &local_identity, cost);
+
+        use rmpv::Value;
+        let offer = Value::Array(vec![
+            Value::Binary(key.to_vec()),
+            Value::Array(vec![Value::Binary(id(0x11))]),
+        ]);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &offer).unwrap();
+
+        let response_bytes = node.handle_offer_request(
+            &buf,
+            [0xDD; 16],
+            true,
+            false,
+            true,
+            Some(&local_identity),
+            Some(&remote_identity),
+        );
+        let response = OfferResponse::from_msgpack(&response_bytes);
+        assert_eq!(response, OfferResponse::ErrorInvalidKey);
     }
 
     #[test]
@@ -1572,7 +1668,8 @@ mod tests {
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &offer).unwrap();
 
-        let response_bytes = node.handle_offer_request(&buf, [0xBB; 16], false, false, true, None);
+        let response_bytes =
+            node.handle_offer_request(&buf, [0xBB; 16], false, false, true, None, None);
         let response = OfferResponse::from_msgpack(&response_bytes);
         assert_eq!(response, OfferResponse::ErrorNoIdentity);
     }
@@ -1582,7 +1679,7 @@ mod tests {
         let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
 
         let response_bytes =
-            node.handle_offer_request(&[0xFF, 0xFF], [0xBB; 16], true, false, true, None);
+            node.handle_offer_request(&[0xFF, 0xFF], [0xBB; 16], true, false, true, None, None);
         let response = OfferResponse::from_msgpack(&response_bytes);
         assert_eq!(response, OfferResponse::ErrorInvalidData);
     }
@@ -1592,10 +1689,7 @@ mod tests {
         use rmpv::Value;
         let offer = Value::Array(vec![
             Value::Binary(vec![0xAA; 32]),
-            Value::Array(vec![
-                Value::Binary(id(0x11)),
-                Value::Binary(id(0x22)),
-            ]),
+            Value::Array(vec![Value::Binary(id(0x11)), Value::Binary(id(0x22))]),
         ]);
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &offer).unwrap();
