@@ -1137,6 +1137,21 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_list_response_rejects_pre_fix_16_byte_ids() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut client = PropagationClient::new(tx, None, None);
+        client.state = PropagationClientState::ListRequested;
+
+        let response = rmpv::Value::Array(vec![rmpv::Value::Binary(vec![0xAB; 16])]);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &response).unwrap();
+
+        client.handle_list_response(&buf);
+        assert!(client.available_messages.is_empty());
+        assert_eq!(client.state, PropagationClientState::Complete);
+    }
+
+    #[test]
     fn test_handle_get_response_parses_messages() {
         let (tx, _rx) = mpsc::channel(16);
         let mut client = PropagationClient::new(tx, None, None);

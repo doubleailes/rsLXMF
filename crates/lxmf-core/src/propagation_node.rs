@@ -968,6 +968,25 @@ mod tests {
     }
 
     #[test]
+    fn test_disk_load_ignores_pre_fix_16_byte_transient_id_filenames() {
+        let dir = std::env::temp_dir().join("lxmf_test_prop_reject_16_byte_ids");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let old_filename = "aabbccddaabbccddaabbccddaabbccdd_1234567890_0";
+        let mut lxmf_data = vec![0xBB; 16];
+        lxmf_data.extend_from_slice(&[0xCC; 64]);
+        std::fs::write(dir.join(old_filename), &lxmf_data).unwrap();
+
+        let node =
+            PropagationNode::with_storage(PropagationNodeConfig::default(), [0xAA; 16], dir.clone())
+                .unwrap();
+        assert_eq!(node.message_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_tick_culls_expired() {
         let config = PropagationNodeConfig {
             max_message_age: 1,

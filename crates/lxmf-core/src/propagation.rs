@@ -48,8 +48,9 @@ impl PropagationEntry {
         )
     }
 
-    /// Accepts both the 3-component format and the legacy 2-component
-    /// `{transient_id}_{timestamp}` form (stamp_value defaults to 0).
+    /// Accepts canonical 64-hex transient IDs in both the 3-component format
+    /// and the older 2-component `{transient_id}_{timestamp}` form (stamp_value
+    /// defaults to 0). Pre-fix 32-hex transient IDs are rejected.
     pub fn parse_filename(filename: &str) -> Option<(PropagationTransientId, f64, u8)> {
         let parts: Vec<&str> = filename.split('_').collect();
         match parts.len() {
@@ -373,12 +374,18 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_filename_2_component_legacy() {
+    fn test_parse_filename_2_component_canonical_id() {
         let fname = format!("{}_1234567890", "aa".repeat(32));
         let (tid, ts, sv) = PropagationEntry::parse_filename(&fname).unwrap();
         assert_eq!(tid[0], 0xaa);
         assert_eq!(ts, 1234567890.0);
         assert_eq!(sv, 0);
+    }
+
+    #[test]
+    fn test_parse_filename_rejects_pre_fix_16_byte_ids() {
+        let fname = "aabbccddaabbccddaabbccddaabbccdd_1234567890_16";
+        assert!(PropagationEntry::parse_filename(fname).is_none());
     }
 
     #[test]
