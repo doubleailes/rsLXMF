@@ -813,7 +813,7 @@ impl LxmRouter {
         self.outbound_propagation_node = destination_hash;
     }
 
-    /// Mark pending direct/opportunistic messages due after a destination announce.
+    /// Mark pending messages due after a destination announce.
     ///
     /// Python's delivery announce handler sets `next_delivery_attempt = time.time()`
     /// and triggers outbound processing. Rust tracks the previous attempt time,
@@ -823,12 +823,7 @@ impl LxmRouter {
         let due_now = now_f64() - DELIVERY_RETRY_WAIT as f64;
         let mut triggered = 0;
         for message in &mut self.pending_outbound {
-            if message.destination_hash == destination_hash
-                && matches!(
-                    message.method,
-                    DeliveryMethod::Direct | DeliveryMethod::Opportunistic
-                )
-            {
+            if message.destination_hash == destination_hash {
                 message.last_delivery_attempt = due_now;
                 triggered += 1;
             }
@@ -1943,6 +1938,31 @@ mod tests {
         assert!(matches!(
             router.process_outbound().as_slice(),
             [OutboundAction::DeliverDirect { .. }]
+        ));
+    }
+
+    #[test]
+    fn test_delivery_announce_trigger_clears_propagated_recipient_backoff() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let dest = [0xAA; 16];
+        let node = [0xCC; 16];
+        router.set_outbound_propagation_node(Some(node));
+        let mut msg = LxMessage::new(
+            dest,
+            [0xBB; 16],
+            "Propagated",
+            "Content",
+            DeliveryMethod::Propagated,
+        );
+        msg.delivery_attempts = 1;
+        msg.last_delivery_attempt = now_f64();
+        router.send(msg);
+
+        assert!(router.process_outbound().is_empty());
+        assert_eq!(router.trigger_outbound_for_delivery_announce(dest), 1);
+        assert!(matches!(
+            router.process_outbound().as_slice(),
+            [OutboundAction::DeliverPropagated { .. }]
         ));
     }
 
