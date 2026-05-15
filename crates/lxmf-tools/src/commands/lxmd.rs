@@ -1755,43 +1755,49 @@ impl LxmdRunner {
             }
 
             let msg_hash = message.hash;
-            let packed = match message.pack() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            // Opportunistic delivery strips the dest_hash prefix
-            // (Python LXMessage.py:629).
-            let encrypt_data = if is_opportunistic && packed.len() > 16 {
-                &packed[16..]
-            } else {
-                &packed
-            };
-
-            let payload = if let Some(ct) = self.encrypt_for_destination(&dest_hex, encrypt_data) {
-                tracing::info!(
-                    dest = %dest_hex,
-                    packed_len = packed.len(),
-                    encrypted_len = ct.len(),
-                    "outbound LXMF: encrypted"
-                );
-                ct
-            } else {
-                // Destination key unknown; re-queue for later.
-                tracing::warn!(
-                    dest = %dest_hex,
-                    attempts = message.delivery_attempts,
-                    "destination key unknown, re-queuing"
-                );
-                requeue_after_path_request(
-                    &mut self.router,
-                    &self.transport_tx,
-                    message,
-                    dest_hash,
-                    "opportunistic destination identity unknown",
-                    true,
-                );
-                continue;
+            let mut missing_identity = false;
+            let payload = match message.pack_opportunistic_encrypted(|plaintext| {
+                self.encrypt_for_destination(&dest_hex, plaintext)
+                    .ok_or_else(|| {
+                        missing_identity = true;
+                        lxmf_core::message::MessageError::PackFailed(format!(
+                            "no identity key for destination {dest_hex}"
+                        ))
+                    })
+            }) {
+                Ok(ct) => {
+                    tracing::info!(
+                        dest = %dest_hex,
+                        encrypted_len = ct.len(),
+                        "outbound LXMF: encrypted opportunistic payload"
+                    );
+                    ct
+                }
+                Err(err) if missing_identity => {
+                    tracing::warn!(
+                        dest = %dest_hex,
+                        attempts = message.delivery_attempts,
+                        error = %err,
+                        "destination key unknown, re-queuing"
+                    );
+                    requeue_after_path_request(
+                        &mut self.router,
+                        &self.transport_tx,
+                        message,
+                        dest_hash,
+                        "opportunistic destination identity unknown",
+                        true,
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        dest = %dest_hex,
+                        error = %err,
+                        "failed to pack opportunistic LXMF message"
+                    );
+                    continue;
+                }
             };
 
             let flags = rns_wire::flags::PacketFlags {

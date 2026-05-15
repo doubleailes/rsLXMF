@@ -340,6 +340,25 @@ impl LxMessage {
         self.pack_propagated_encrypted_inner(encrypt_fn, Some(target_cost))
     }
 
+    /// Pack the payload that Reticulum carries for Opportunistic delivery.
+    ///
+    /// Python `LXMessage.__as_packet()` encrypts the complete LXMF packet after
+    /// the leading destination hash because the RNS packet header already
+    /// carries that destination. Keeping this helper in core prevents callers
+    /// from reimplementing the destination-prefix stripping differently.
+    pub fn pack_opportunistic_encrypted<F>(&self, encrypt_fn: F) -> Result<Vec<u8>, MessageError>
+    where
+        F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
+    {
+        let packed = self.pack()?;
+        if packed.len() <= DESTINATION_LENGTH {
+            return Err(MessageError::PackFailed(
+                "packed LXMF message missing opportunistic payload tail".to_string(),
+            ));
+        }
+        encrypt_fn(&packed[DESTINATION_LENGTH..])
+    }
+
     fn pack_propagated_encrypted_inner<F>(
         &mut self,
         encrypt_fn: F,
@@ -2025,6 +2044,33 @@ mod tests {
 
         let lxmf_data = &entries[0];
         assert_eq!(&lxmf_data[..16], &[0xAA; 16]);
+    }
+
+    #[test]
+    fn test_pack_opportunistic_encrypted_strips_destination_hash() {
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Opportunistic",
+            "Content body here",
+            DeliveryMethod::Opportunistic,
+        );
+        msg.sign(&key).unwrap();
+        let packed = msg.pack().unwrap();
+        let expected_tail = packed[DESTINATION_LENGTH..].to_vec();
+
+        let encrypted = msg
+            .pack_opportunistic_encrypted(|plaintext| {
+                assert_eq!(plaintext, expected_tail.as_slice());
+                let mut out = vec![0xEE];
+                out.extend_from_slice(plaintext);
+                Ok(out)
+            })
+            .unwrap();
+
+        assert_eq!(encrypted[0], 0xEE);
+        assert_eq!(&encrypted[1..], expected_tail.as_slice());
     }
 
     #[test]
