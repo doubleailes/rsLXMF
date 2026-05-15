@@ -132,6 +132,135 @@ impl fmt::Display for SendError {
 
 impl std::error::Error for SendError {}
 
+/// Current route metadata for an LXMF Direct delivery destination.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectRouteSnapshot {
+    pub destination_hash: [u8; 16],
+    pub hops: u8,
+    pub interface_name: Option<String>,
+    pub learned_at: Option<f64>,
+    pub expires_at: Option<f64>,
+}
+
+impl DirectRouteSnapshot {
+    pub fn new(destination_hash: [u8; 16], hops: u8) -> Self {
+        Self {
+            destination_hash,
+            hops: hops.max(1),
+            interface_name: None,
+            learned_at: None,
+            expires_at: None,
+        }
+    }
+}
+
+/// Reusable Direct/backchannel Link state visible to the router-level policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectReusableLinkState {
+    None,
+    Pending,
+    Active,
+    Closed { activated: bool },
+}
+
+/// Input snapshot for core Direct-delivery planning.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectDeliveryPlanInput {
+    pub identity_known: bool,
+    pub route: Option<DirectRouteSnapshot>,
+    pub reusable_link: DirectReusableLinkState,
+}
+
+/// Core Direct-delivery policy decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectDeliveryPlan {
+    UseReusableLink,
+    WaitForReusableLink,
+    StartNewLink { hops: u8 },
+    RequestPath { drop_existing: bool },
+    DeferTerminalFailure,
+    Fail,
+}
+
+/// Apply upstream LXMF Direct delivery attempt/path/link policy to one message.
+///
+/// This is a policy primitive for embedders that still own transport adapters.
+/// It mutates the same attempt/progress fields Python mutates in
+/// `LXMRouter.process_outbound`, but leaves actual path requests and Link
+/// creation to the caller.
+pub fn plan_direct_delivery(
+    message: &mut LxMessage,
+    input: DirectDeliveryPlanInput,
+    now: f64,
+) -> DirectDeliveryPlan {
+    if message.delivery_attempts > MAX_DELIVERY_ATTEMPTS {
+        message.mark_failed();
+        return DirectDeliveryPlan::Fail;
+    }
+
+    match input.reusable_link {
+        DirectReusableLinkState::Active => {
+            if message.progress < 0.05 {
+                message.progress = 0.05;
+            }
+            if message.state != MessageState::Sending {
+                message.mark_sending();
+            }
+            return DirectDeliveryPlan::UseReusableLink;
+        }
+        DirectReusableLinkState::Pending => {
+            return DirectDeliveryPlan::WaitForReusableLink;
+        }
+        DirectReusableLinkState::Closed { .. } => {
+            message.next_delivery_attempt = now + PATH_REQUEST_WAIT as f64;
+            if message.progress < 0.01 {
+                message.progress = 0.01;
+            }
+            return DirectDeliveryPlan::RequestPath {
+                drop_existing: true,
+            };
+        }
+        DirectReusableLinkState::None => {}
+    }
+
+    if !input.identity_known {
+        message.delivery_attempts += 1;
+        message.last_delivery_attempt = now;
+        message.next_delivery_attempt = now + PATH_REQUEST_WAIT as f64;
+        if message.progress < 0.01 {
+            message.progress = 0.01;
+        }
+        return DirectDeliveryPlan::RequestPath {
+            drop_existing: false,
+        };
+    }
+
+    message.delivery_attempts += 1;
+    message.last_delivery_attempt = now;
+    message.next_delivery_attempt = now + DELIVERY_RETRY_WAIT as f64;
+
+    if message.delivery_attempts >= MAX_DELIVERY_ATTEMPTS {
+        return DirectDeliveryPlan::DeferTerminalFailure;
+    }
+
+    if let Some(route) = input.route {
+        if message.progress < 0.03 {
+            message.progress = 0.03;
+        }
+        DirectDeliveryPlan::StartNewLink {
+            hops: route.hops.max(1),
+        }
+    } else {
+        message.next_delivery_attempt = now + PATH_REQUEST_WAIT as f64;
+        if message.progress < 0.01 {
+            message.progress = 0.01;
+        }
+        DirectDeliveryPlan::RequestPath {
+            drop_existing: false,
+        }
+    }
+}
+
 /// LXMF router — owns all mutable state under the actor pattern.
 pub struct LxmRouter {
     pub config: RouterConfig,
@@ -1460,6 +1589,16 @@ fn now_f64() -> f64 {
 mod tests {
     use super::*;
 
+    fn direct_policy_message() -> LxMessage {
+        LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Direct",
+            "hello",
+            DeliveryMethod::Direct,
+        )
+    }
+
     #[test]
     fn test_router_creation() {
         let router = LxmRouter::new(RouterConfig::default());
@@ -1481,6 +1620,158 @@ mod tests {
         assert!(config.ext.max_message_size.is_none());
         assert!(!config.ext.enforce_ratchets);
         assert!(!config.ext.enforce_stamps);
+    }
+
+    #[test]
+    fn test_direct_delivery_plan_starts_link_with_current_path() {
+        let mut msg = direct_policy_message();
+        let dest = msg.destination_hash;
+        let now = 1000.0;
+        let plan = plan_direct_delivery(
+            &mut msg,
+            DirectDeliveryPlanInput {
+                identity_known: true,
+                route: Some(DirectRouteSnapshot::new(dest, 4)),
+                reusable_link: DirectReusableLinkState::None,
+            },
+            now,
+        );
+
+        assert_eq!(plan, DirectDeliveryPlan::StartNewLink { hops: 4 });
+        assert_eq!(msg.delivery_attempts, 1);
+        assert_eq!(msg.last_delivery_attempt, now);
+        assert_eq!(msg.next_delivery_attempt, now + DELIVERY_RETRY_WAIT as f64);
+        assert_eq!(msg.progress, 0.03);
+    }
+
+    #[test]
+    fn test_direct_delivery_plan_requests_path_for_unknown_identity() {
+        let mut msg = direct_policy_message();
+        let now = 1000.0;
+        let plan = plan_direct_delivery(
+            &mut msg,
+            DirectDeliveryPlanInput {
+                identity_known: false,
+                route: None,
+                reusable_link: DirectReusableLinkState::None,
+            },
+            now,
+        );
+
+        assert_eq!(
+            plan,
+            DirectDeliveryPlan::RequestPath {
+                drop_existing: false
+            }
+        );
+        assert_eq!(msg.delivery_attempts, 1);
+        assert_eq!(msg.last_delivery_attempt, now);
+        assert_eq!(msg.next_delivery_attempt, now + PATH_REQUEST_WAIT as f64);
+        assert_eq!(msg.progress, 0.01);
+    }
+
+    #[test]
+    fn test_direct_delivery_plan_reuses_active_link_without_attempt_increment() {
+        let mut msg = direct_policy_message();
+        let plan = plan_direct_delivery(
+            &mut msg,
+            DirectDeliveryPlanInput {
+                identity_known: true,
+                route: None,
+                reusable_link: DirectReusableLinkState::Active,
+            },
+            1000.0,
+        );
+
+        assert_eq!(plan, DirectDeliveryPlan::UseReusableLink);
+        assert_eq!(msg.delivery_attempts, 0);
+        assert_eq!(msg.state, MessageState::Sending);
+        assert_eq!(msg.progress, 0.05);
+    }
+
+    #[test]
+    fn test_direct_delivery_plan_waits_for_pending_link() {
+        let mut msg = direct_policy_message();
+        let dest = msg.destination_hash;
+        let plan = plan_direct_delivery(
+            &mut msg,
+            DirectDeliveryPlanInput {
+                identity_known: true,
+                route: Some(DirectRouteSnapshot::new(dest, 2)),
+                reusable_link: DirectReusableLinkState::Pending,
+            },
+            1000.0,
+        );
+
+        assert_eq!(plan, DirectDeliveryPlan::WaitForReusableLink);
+        assert_eq!(msg.delivery_attempts, 0);
+        assert_eq!(msg.next_delivery_attempt, 0.0);
+    }
+
+    #[test]
+    fn test_direct_delivery_plan_defers_terminal_failure_at_attempt_boundary() {
+        let mut msg = direct_policy_message();
+        let dest = msg.destination_hash;
+        msg.delivery_attempts = MAX_DELIVERY_ATTEMPTS - 1;
+        let now = 1000.0;
+        let plan = plan_direct_delivery(
+            &mut msg,
+            DirectDeliveryPlanInput {
+                identity_known: true,
+                route: Some(DirectRouteSnapshot::new(dest, 1)),
+                reusable_link: DirectReusableLinkState::None,
+            },
+            now,
+        );
+
+        assert_eq!(plan, DirectDeliveryPlan::DeferTerminalFailure);
+        assert_eq!(msg.delivery_attempts, MAX_DELIVERY_ATTEMPTS);
+        assert_eq!(msg.next_delivery_attempt, now + DELIVERY_RETRY_WAIT as f64);
+    }
+
+    #[test]
+    fn test_direct_delivery_plan_requests_rediscovery_for_closed_link() {
+        let mut msg = direct_policy_message();
+        let dest = msg.destination_hash;
+        let now = 1000.0;
+        let plan = plan_direct_delivery(
+            &mut msg,
+            DirectDeliveryPlanInput {
+                identity_known: true,
+                route: Some(DirectRouteSnapshot::new(dest, 3)),
+                reusable_link: DirectReusableLinkState::Closed { activated: false },
+            },
+            now,
+        );
+
+        assert_eq!(
+            plan,
+            DirectDeliveryPlan::RequestPath {
+                drop_existing: true
+            }
+        );
+        assert_eq!(msg.delivery_attempts, 0);
+        assert_eq!(msg.next_delivery_attempt, now + PATH_REQUEST_WAIT as f64);
+        assert_eq!(msg.progress, 0.01);
+    }
+
+    #[test]
+    fn test_direct_delivery_plan_fails_above_max_attempts() {
+        let mut msg = direct_policy_message();
+        let dest = msg.destination_hash;
+        msg.delivery_attempts = MAX_DELIVERY_ATTEMPTS + 1;
+        let plan = plan_direct_delivery(
+            &mut msg,
+            DirectDeliveryPlanInput {
+                identity_known: true,
+                route: Some(DirectRouteSnapshot::new(dest, 1)),
+                reusable_link: DirectReusableLinkState::None,
+            },
+            1000.0,
+        );
+
+        assert_eq!(plan, DirectDeliveryPlan::Fail);
+        assert_eq!(msg.state, MessageState::Failed);
     }
 
     #[test]
