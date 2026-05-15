@@ -5,14 +5,14 @@
 //! messages via resource segmentation, delivery confirmation via link-level proofs, and sender
 //! identity verification via link identification.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
 use rns_link::constants::{ESTABLISHMENT_TIMEOUT_PER_HOP, KEEPALIVE_DEFAULT};
-use rns_link::link::{CloseReason, Link};
+use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
 use rns_protocol::resource::{
     MAX_EFFICIENT_SIZE, MultiSegmentOutbound, OutboundResource, OutboundTransfer, ResourceError,
     TransferAction,
@@ -26,9 +26,14 @@ use crate::constants::{DeliveryRepresentation, LXMF_OVERHEAD};
 use crate::message::LxMessage;
 use crate::propagation::hex_encode;
 
+/// Upstream LXMF keeps reusable Direct links open for ten minutes of data
+/// inactivity before tearing them down (`LXMRouter.LINK_MAX_INACTIVITY`).
+const LINK_MAX_INACTIVITY: Duration = Duration::from_secs(600);
+
 /// State of a link-based delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryState {
+    Idle,
     Establishing,
     Identifying,
     Transferring,
@@ -61,6 +66,80 @@ pub struct PendingDelivery {
     pub timeout: Duration,
     pub msg_hash: Option<[u8; 32]>,
     pub failure_reason: Option<String>,
+    /// Keep successful Direct links open for additional messages. Propagation
+    /// deposits currently keep the old one-shot behavior.
+    pub reusable: bool,
+    /// Upstream identifies the initiator after the first successful Direct
+    /// delivery, making the link usable as a peer backchannel.
+    pub backchannel_identified: bool,
+    queued: VecDeque<QueuedDelivery>,
+}
+
+/// Message payload waiting for an existing Direct link to become active/idle.
+struct QueuedDelivery {
+    message: LxMessage,
+    packed_override: Option<Vec<u8>>,
+    auto_compress: bool,
+    msg_hash: Option<[u8; 32]>,
+    queued_at: Instant,
+}
+
+impl QueuedDelivery {
+    fn new(message: LxMessage, packed_override: Option<Vec<u8>>, auto_compress: bool) -> Self {
+        let msg_hash = message.hash;
+        Self {
+            message,
+            packed_override,
+            auto_compress,
+            msg_hash,
+            queued_at: Instant::now(),
+        }
+    }
+}
+
+impl PendingDelivery {
+    fn active_delivery_count(&self) -> usize {
+        let current = if self.state == DeliveryState::Idle {
+            0
+        } else {
+            1
+        };
+        current + self.queued.len()
+    }
+
+    fn queue_delivery(
+        &mut self,
+        message: LxMessage,
+        packed_override: Option<Vec<u8>>,
+        auto_compress: bool,
+    ) {
+        self.queued
+            .push_back(QueuedDelivery::new(message, packed_override, auto_compress));
+    }
+
+    fn start_queued_delivery(&mut self) -> bool {
+        let Some(next) = self.queued.pop_front() else {
+            return false;
+        };
+        self.message = next.message;
+        self.packed_override = next.packed_override;
+        self.auto_compress = next.auto_compress;
+        self.transfer = None;
+        self.remaining_segments.clear();
+        self.packet_proof_hash = None;
+        self.started_at = Instant::now();
+        self.msg_hash = next.msg_hash;
+        self.failure_reason = None;
+        self.state = DeliveryState::Identifying;
+        tracing::debug!(
+            link_id = %hex_encode(&self.link.link_id),
+            dest = %hex_encode(&self.dest_hash),
+            queued_for_secs = next.queued_at.elapsed().as_secs_f64(),
+            remaining_queue = self.queued.len(),
+            "starting queued Direct link delivery"
+        );
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +186,8 @@ fn start_error_from_reserve(err: TrySendError<()>) -> LinkDeliveryStartError {
 /// packets, and [`Self::tick`] periodically to advance transfers and enforce timeouts.
 pub struct LinkDeliveryManager {
     transport_tx: mpsc::Sender<TransportMessage>,
+    /// Reusable upstream-style Direct links keyed by LXMF delivery destination hash.
+    direct_links: HashMap<[u8; 16], [u8; 16]>,
     pending: HashMap<[u8; 16], PendingDelivery>,
     identity_pub: Option<[u8; 64]>,
     identity_key: Option<Ed25519PrivateKey>,
@@ -123,6 +204,7 @@ impl LinkDeliveryManager {
         let (event_tx, event_rx) = mpsc::channel(256);
         Self {
             transport_tx,
+            direct_links: HashMap::new(),
             pending: HashMap::new(),
             identity_pub,
             identity_key,
@@ -138,7 +220,7 @@ impl LinkDeliveryManager {
         dest_hash: [u8; 16],
         hops: u8,
     ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
-        self.start_delivery_inner(message, dest_hash, hops, None, true)
+        self.start_direct_delivery(message, dest_hash, hops)
     }
 
     /// Start a link delivery with an already-packed payload.
@@ -159,7 +241,44 @@ impl LinkDeliveryManager {
             hops,
             Some(packed_payload),
             auto_compress,
+            false,
         )
+    }
+
+    fn start_direct_delivery(
+        &mut self,
+        message: LxMessage,
+        dest_hash: [u8; 16],
+        hops: u8,
+    ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
+        if let Some(link_id) = self.direct_links.get(&dest_hash).copied() {
+            if let Some(delivery) = self.pending.get_mut(&link_id)
+                && delivery.reusable
+            {
+                let state = delivery.state;
+                let link_state = delivery.link.state;
+                if state == DeliveryState::Idle && delivery.link.is_active() {
+                    delivery.queue_delivery(message, None, true);
+                    let _ = delivery.start_queued_delivery();
+                } else {
+                    delivery.queue_delivery(message, None, true);
+                }
+                tracing::debug!(
+                    link_id = %hex_encode(&link_id),
+                    dest = %hex_encode(&dest_hash),
+                    state = ?state,
+                    link_state = ?link_state,
+                    queued = delivery.queued.len(),
+                    pending_count = delivery.active_delivery_count(),
+                    "reusing cached Direct link delivery session"
+                );
+                return Ok(link_id);
+            }
+
+            self.direct_links.remove(&dest_hash);
+        }
+
+        self.start_delivery_inner(message, dest_hash, hops, None, true, true)
     }
 
     fn start_delivery_inner(
@@ -169,11 +288,12 @@ impl LinkDeliveryManager {
         hops: u8,
         packed_override: Option<Vec<u8>>,
         auto_compress: bool,
+        reusable: bool,
     ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
         let msg_hash = message.hash;
         let (link, request_data) = Link::new_initiator(dest_hash, hops);
         let link_id = link.link_id;
-        let pending_count = self.pending.len();
+        let pending_count = self.pending_count();
 
         let register_permit = match self.transport_tx.try_reserve() {
             Ok(permit) => permit,
@@ -258,14 +378,21 @@ impl LinkDeliveryManager {
                 timeout: Duration::from_secs_f64(timeout_secs),
                 msg_hash,
                 failure_reason: None,
+                reusable,
+                backchannel_identified: false,
+                queued: VecDeque::new(),
             },
         );
+        if reusable {
+            self.direct_links.insert(dest_hash, link_id);
+        }
 
         tracing::debug!(
             link_id = %hex_encode(&link_id),
             dest = %hex_encode(&dest_hash),
             hops = hops.max(1),
             pending_count,
+            reusable,
             register_result = "ok",
             outbound_result = "ok",
             establishment_timeout_secs,
@@ -417,6 +544,11 @@ impl LinkDeliveryManager {
                                 self.handle_resource_reject(&link_id, &pt);
                             }
                         }
+                        rns_wire::context::PacketContext::Keepalive => {
+                            if let Some(delivery) = self.pending.get_mut(&link_id) {
+                                delivery.link.record_inbound();
+                            }
+                        }
                         rns_wire::context::PacketContext::LinkClose => {
                             self.handle_link_closed(&link_id, Some(data));
                         }
@@ -493,194 +625,285 @@ impl LinkDeliveryManager {
         let mut to_remove = Vec::new();
 
         for (link_id, delivery) in &mut self.pending {
-            let elapsed = delivery.started_at.elapsed();
-            let (timed_out, timeout, reason) = if delivery.state == DeliveryState::Establishing {
-                (
-                    elapsed > delivery.establishment_timeout,
-                    delivery.establishment_timeout,
-                    "link establishment timeout",
-                )
-            } else {
-                (
-                    elapsed > delivery.timeout,
-                    delivery.timeout,
-                    "delivery timeout",
-                )
-            };
+            let mut remove_session = false;
 
-            if timed_out {
-                let state = delivery.state;
-                delivery.state = DeliveryState::Failed;
-                delivery.failure_reason = Some(reason.to_string());
-                tracing::warn!(
-                    link_id = %hex_encode(link_id),
-                    dest = %hex_encode(&delivery.dest_hash),
-                    state = ?state,
-                    age_secs = elapsed.as_secs_f64(),
-                    timeout_secs = timeout.as_secs_f64(),
-                    reason,
-                    "link delivery timed out"
-                );
-                results.push(DeliveryResult::Failed {
-                    link_id: *link_id,
-                    msg_hash: delivery.msg_hash,
-                    dest_hash: delivery.dest_hash,
-                    message: delivery.message.clone(),
-                    reason: reason.to_string(),
-                });
-                to_remove.push(*link_id);
-                continue;
+            if delivery.state == DeliveryState::Idle
+                && !delivery.queued.is_empty()
+                && delivery.link.is_active()
+            {
+                let _ = delivery.start_queued_delivery();
             }
 
-            match delivery.state {
-                DeliveryState::Identifying if delivery.link.is_active() => {
-                    if let (Some(pub_key), Some(sign_key)) =
-                        (&self.identity_pub, &self.identity_key)
-                        && let Ok(identify_data) = delivery.link.identify(pub_key, sign_key)
-                    {
-                        let id_header = rns_wire::header::PacketHeader {
-                            flags: rns_wire::flags::PacketFlags {
-                                header_type: rns_wire::flags::HeaderType::Header1,
-                                context_flag: false,
-                                transport_type: rns_wire::flags::TransportType::Broadcast,
-                                destination_type: rns_wire::flags::DestinationType::Link,
-                                packet_type: rns_wire::flags::PacketType::Data,
-                            },
-                            hops: 0,
-                            transport_id: None,
-                            destination_hash: *link_id,
-                            context: rns_wire::context::PacketContext::LinkIdentify,
-                        };
-                        let mut id_raw = id_header.pack();
-                        id_raw.extend_from_slice(&identify_data);
-                        let _ = self.transport_tx.try_send(TransportMessage::Outbound(
-                            OutboundRequest {
-                                raw: Bytes::from(id_raw),
-                                destination_hash: *link_id,
-                            },
-                        ));
-                    }
-                    // Advance regardless of identification success.
-                    delivery.state = DeliveryState::Transferring;
+            if matches!(
+                delivery.state,
+                DeliveryState::Establishing
+                    | DeliveryState::Identifying
+                    | DeliveryState::Transferring
+                    | DeliveryState::AwaitingProof
+            ) {
+                let elapsed = delivery.started_at.elapsed();
+                let (timed_out, timeout, reason) = if delivery.state == DeliveryState::Establishing
+                {
+                    (
+                        elapsed > delivery.establishment_timeout,
+                        delivery.establishment_timeout,
+                        "link establishment timeout",
+                    )
+                } else {
+                    (
+                        elapsed > delivery.timeout,
+                        delivery.timeout,
+                        "delivery timeout",
+                    )
+                };
 
-                    let packed = if let Some(ref packed) = delivery.packed_override {
-                        Ok(packed.clone())
-                    } else {
-                        delivery.message.pack()
-                    };
-                    if let Ok(packed) = packed {
-                        let packet_limit = if delivery.packed_override.is_some() {
-                            delivery.link.mdu.saturating_sub(LXMF_OVERHEAD)
-                        } else {
-                            delivery.link.mdu
-                        };
-                        if packed.len() <= packet_limit {
-                            // Python LXMessage sends Direct messages that fit in Link.MDU
-                            // as a single encrypted link packet, then waits for LINKPROOF.
-                            delivery.message.representation = DeliveryRepresentation::Packet;
-                            match send_link_packet(link_id, delivery, &self.transport_tx, &packed) {
-                                Some(packet_hash) => {
-                                    delivery.packet_proof_hash = Some(packet_hash);
-                                    delivery.state = DeliveryState::AwaitingProof;
-                                }
-                                None => {
-                                    delivery.state = DeliveryState::Failed;
-                                    delivery.failure_reason =
-                                        Some("link packet encryption failed".to_string());
-                                }
-                            }
-                        } else {
-                            delivery.message.representation = DeliveryRepresentation::Resource;
-                            // Python's Resource encrypts the blob with link session keys
-                            // BEFORE chunking (Resource.py:424), and resource parts are sent
-                            // on the wire WITHOUT additional packet-layer encryption
-                            // (Packet.py:201-204).
-                            let rtt = delivery.link.rtt.unwrap_or(Duration::from_millis(500));
-                            let auto_compress = if delivery.packed_override.is_some() {
-                                delivery.auto_compress
-                            } else {
-                                delivery.message.auto_compress
-                            };
-                            let transfer_result =
-                                build_resource_transfer(&delivery.link, packed, auto_compress, rtt);
-                            match transfer_result {
-                                Ok((transfer, remaining_segments)) => {
-                                    delivery.transfer = Some(transfer);
-                                    delivery.remaining_segments = remaining_segments;
-                                }
-                                Err(e) => {
-                                    let _ = e;
-                                    delivery.state = DeliveryState::Failed;
-                                    delivery.failure_reason =
-                                        Some("resource transfer build failed".to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-                DeliveryState::Identifying => {}
-                DeliveryState::Transferring => {
-                    // Process up to a full window of actions per tick so the 500ms tick rate
-                    // doesn't throttle us below link speed.
-                    let max_actions = 16;
-                    for _ in 0..max_actions {
-                        if delivery.state != DeliveryState::Transferring {
-                            break;
-                        }
-                        let Some(ref mut transfer) = delivery.transfer else {
-                            break;
-                        };
-                        let action = transfer.tick();
-                        match dispatch_action(link_id, delivery, &self.transport_tx, action) {
-                            ActionOutcome::Continue => continue,
-                            ActionOutcome::Break => break,
-                            ActionOutcome::Complete => {
-                                results.push(DeliveryResult::Complete {
-                                    link_id: *link_id,
-                                    msg_hash: delivery.msg_hash,
-                                });
-                                to_remove.push(*link_id);
-                            }
-                            ActionOutcome::Fail(reason) => {
-                                results.push(DeliveryResult::Failed {
-                                    link_id: *link_id,
-                                    msg_hash: delivery.msg_hash,
-                                    dest_hash: delivery.dest_hash,
-                                    message: delivery.message.clone(),
-                                    reason,
-                                });
-                                to_remove.push(*link_id);
-                            }
-                        }
-                    }
-                }
-                DeliveryState::Complete => {
-                    results.push(DeliveryResult::Complete {
-                        link_id: *link_id,
-                        msg_hash: delivery.msg_hash,
-                    });
-                    to_remove.push(*link_id);
-                }
-                DeliveryState::Failed => {
-                    let reason = delivery
-                        .failure_reason
-                        .take()
-                        .unwrap_or_else(|| "delivery failed".to_string());
-                    results.push(DeliveryResult::Failed {
-                        link_id: *link_id,
-                        msg_hash: delivery.msg_hash,
-                        dest_hash: delivery.dest_hash,
-                        message: delivery.message.clone(),
+                if timed_out {
+                    let state = delivery.state;
+                    delivery.state = DeliveryState::Failed;
+                    delivery.failure_reason = Some(reason.to_string());
+                    tracing::warn!(
+                        link_id = %hex_encode(link_id),
+                        dest = %hex_encode(&delivery.dest_hash),
+                        state = ?state,
+                        age_secs = elapsed.as_secs_f64(),
+                        timeout_secs = timeout.as_secs_f64(),
                         reason,
-                    });
-                    to_remove.push(*link_id);
+                        queued = delivery.queued.len(),
+                        "link delivery timed out"
+                    );
+                    push_failed_delivery_and_queue(&mut results, *link_id, delivery, reason);
+                    remove_session = true;
                 }
-                _ => {}
+            }
+
+            if !remove_session {
+                match delivery.state {
+                    DeliveryState::Idle => {}
+                    DeliveryState::Identifying if delivery.link.is_active() => {
+                        if !delivery.reusable
+                            && let (Some(pub_key), Some(sign_key)) =
+                                (&self.identity_pub, &self.identity_key)
+                            && let Ok(identify_data) = delivery.link.identify(pub_key, sign_key)
+                        {
+                            let id_header = rns_wire::header::PacketHeader {
+                                flags: rns_wire::flags::PacketFlags {
+                                    header_type: rns_wire::flags::HeaderType::Header1,
+                                    context_flag: false,
+                                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                                    destination_type: rns_wire::flags::DestinationType::Link,
+                                    packet_type: rns_wire::flags::PacketType::Data,
+                                },
+                                hops: 0,
+                                transport_id: None,
+                                destination_hash: *link_id,
+                                context: rns_wire::context::PacketContext::LinkIdentify,
+                            };
+                            let mut id_raw = id_header.pack();
+                            id_raw.extend_from_slice(&identify_data);
+                            let _ = self.transport_tx.try_send(TransportMessage::Outbound(
+                                OutboundRequest {
+                                    raw: Bytes::from(id_raw),
+                                    destination_hash: *link_id,
+                                },
+                            ));
+                        }
+                        // Reusable Direct links follow upstream LXMF and identify
+                        // after a successful delivery, not before the transfer.
+                        // One-shot propagation links keep the previous pre-transfer
+                        // identify behavior for compatibility with existing callers.
+                        delivery.state = DeliveryState::Transferring;
+
+                        let packed = if let Some(ref packed) = delivery.packed_override {
+                            Ok(packed.clone())
+                        } else {
+                            delivery.message.pack()
+                        };
+                        if let Ok(packed) = packed {
+                            let packet_limit = if delivery.packed_override.is_some() {
+                                delivery.link.mdu.saturating_sub(LXMF_OVERHEAD)
+                            } else {
+                                delivery.link.mdu
+                            };
+                            if packed.len() <= packet_limit {
+                                // Python LXMessage sends Direct messages that fit in Link.MDU
+                                // as a single encrypted link packet, then waits for LINKPROOF.
+                                delivery.message.representation = DeliveryRepresentation::Packet;
+                                match send_link_packet(
+                                    link_id,
+                                    delivery,
+                                    &self.transport_tx,
+                                    &packed,
+                                ) {
+                                    Some(packet_hash) => {
+                                        delivery.packet_proof_hash = Some(packet_hash);
+                                        delivery.state = DeliveryState::AwaitingProof;
+                                    }
+                                    None => {
+                                        delivery.state = DeliveryState::Failed;
+                                        delivery.failure_reason =
+                                            Some("link packet encryption failed".to_string());
+                                    }
+                                }
+                            } else {
+                                delivery.message.representation = DeliveryRepresentation::Resource;
+                                // Python's Resource encrypts the blob with link session keys
+                                // BEFORE chunking (Resource.py:424), and resource parts are sent
+                                // on the wire WITHOUT additional packet-layer encryption
+                                // (Packet.py:201-204).
+                                let rtt = delivery.link.rtt.unwrap_or(Duration::from_millis(500));
+                                let auto_compress = if delivery.packed_override.is_some() {
+                                    delivery.auto_compress
+                                } else {
+                                    delivery.message.auto_compress
+                                };
+                                let transfer_result = build_resource_transfer(
+                                    &delivery.link,
+                                    packed,
+                                    auto_compress,
+                                    rtt,
+                                );
+                                match transfer_result {
+                                    Ok((transfer, remaining_segments)) => {
+                                        delivery.transfer = Some(transfer);
+                                        delivery.remaining_segments = remaining_segments;
+                                    }
+                                    Err(e) => {
+                                        let _ = e;
+                                        delivery.state = DeliveryState::Failed;
+                                        delivery.failure_reason =
+                                            Some("resource transfer build failed".to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    DeliveryState::Identifying => {}
+                    DeliveryState::Transferring => {
+                        // Process up to a full window of actions per tick so the 500ms tick rate
+                        // doesn't throttle us below link speed.
+                        let max_actions = 16;
+                        for _ in 0..max_actions {
+                            if delivery.state != DeliveryState::Transferring {
+                                break;
+                            }
+                            let Some(ref mut transfer) = delivery.transfer else {
+                                break;
+                            };
+                            let action = transfer.tick();
+                            match dispatch_action(link_id, delivery, &self.transport_tx, action) {
+                                ActionOutcome::Continue => continue,
+                                ActionOutcome::Break => break,
+                                ActionOutcome::Complete => {
+                                    results.push(DeliveryResult::Complete {
+                                        link_id: *link_id,
+                                        msg_hash: delivery.msg_hash,
+                                    });
+                                    if delivery.reusable && delivery.link.state != LinkState::Closed
+                                    {
+                                        finish_reusable_delivery(
+                                            &self.transport_tx,
+                                            &self.identity_pub,
+                                            &self.identity_key,
+                                            link_id,
+                                            delivery,
+                                        );
+                                    } else {
+                                        fail_queued_deliveries(
+                                            &mut results,
+                                            *link_id,
+                                            delivery,
+                                            "link closed",
+                                        );
+                                        remove_session = true;
+                                    }
+                                }
+                                ActionOutcome::Fail(reason) => {
+                                    push_failed_delivery_and_queue(
+                                        &mut results,
+                                        *link_id,
+                                        delivery,
+                                        &reason,
+                                    );
+                                    remove_session = true;
+                                }
+                            }
+                        }
+                    }
+                    DeliveryState::Complete => {
+                        results.push(DeliveryResult::Complete {
+                            link_id: *link_id,
+                            msg_hash: delivery.msg_hash,
+                        });
+                        if delivery.reusable && delivery.link.state != LinkState::Closed {
+                            finish_reusable_delivery(
+                                &self.transport_tx,
+                                &self.identity_pub,
+                                &self.identity_key,
+                                link_id,
+                                delivery,
+                            );
+                        } else {
+                            fail_queued_deliveries(&mut results, *link_id, delivery, "link closed");
+                            remove_session = true;
+                        }
+                    }
+                    DeliveryState::Failed => {
+                        let reason = delivery
+                            .failure_reason
+                            .take()
+                            .unwrap_or_else(|| "delivery failed".to_string());
+                        push_failed_delivery_and_queue(&mut results, *link_id, delivery, &reason);
+                        remove_session = true;
+                    }
+                    DeliveryState::Establishing | DeliveryState::AwaitingProof => {}
+                }
+            }
+
+            if !remove_session && delivery.reusable {
+                if delivery.link.state == LinkState::Closed {
+                    fail_queued_deliveries(&mut results, *link_id, delivery, "link closed");
+                    remove_session = true;
+                } else if delivery.state == DeliveryState::Idle
+                    && delivery.queued.is_empty()
+                    && delivery.link.is_active()
+                    && link_data_idle_for(&delivery.link) > LINK_MAX_INACTIVITY
+                {
+                    tracing::debug!(
+                        link_id = %hex_encode(link_id),
+                        dest = %hex_encode(&delivery.dest_hash),
+                        idle_secs = link_data_idle_for(&delivery.link).as_secs_f64(),
+                        "tearing down inactive Direct link"
+                    );
+                    send_link_teardown(&self.transport_tx, link_id, &mut delivery.link);
+                    remove_session = true;
+                } else if drive_link_action(&self.transport_tx, link_id, delivery.link.tick()) {
+                    if !matches!(
+                        delivery.state,
+                        DeliveryState::Idle | DeliveryState::Complete
+                    ) {
+                        push_failed_delivery_and_queue(
+                            &mut results,
+                            *link_id,
+                            delivery,
+                            "link closed",
+                        );
+                    } else {
+                        fail_queued_deliveries(&mut results, *link_id, delivery, "link closed");
+                    }
+                    remove_session = true;
+                }
+            }
+
+            if remove_session {
+                to_remove.push(*link_id);
             }
         }
 
         for link_id in to_remove {
             if let Some(mut delivery) = self.pending.remove(&link_id) {
+                if delivery.reusable {
+                    self.direct_links.remove(&delivery.dest_hash);
+                }
                 send_link_teardown(&self.transport_tx, &link_id, &mut delivery.link);
                 let _ = self
                     .transport_tx
@@ -790,6 +1013,10 @@ impl LinkDeliveryManager {
             if delivery.state == DeliveryState::Complete {
                 return true;
             }
+            if delivery.state == DeliveryState::Idle {
+                delivery.failure_reason = Some("link closed".to_string());
+                return true;
+            }
             delivery.transfer = None;
             delivery.remaining_segments.clear();
             delivery.packet_proof_hash = None;
@@ -816,8 +1043,188 @@ impl LinkDeliveryManager {
     }
 
     pub fn pending_count(&self) -> usize {
+        self.pending
+            .values()
+            .map(PendingDelivery::active_delivery_count)
+            .sum()
+    }
+
+    pub fn session_count(&self) -> usize {
         self.pending.len()
     }
+}
+
+fn finish_reusable_delivery(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    identity_pub: &Option<[u8; 64]>,
+    identity_key: &Option<Ed25519PrivateKey>,
+    link_id: &[u8; 16],
+    delivery: &mut PendingDelivery,
+) {
+    if !delivery.backchannel_identified
+        && let (Some(pub_key), Some(sign_key)) = (identity_pub, identity_key)
+    {
+        delivery.backchannel_identified =
+            send_link_identify(transport_tx, link_id, &delivery.link, pub_key, sign_key);
+    }
+
+    delivery.transfer = None;
+    delivery.remaining_segments.clear();
+    delivery.packet_proof_hash = None;
+    delivery.failure_reason = None;
+
+    if delivery.link.is_active() && delivery.start_queued_delivery() {
+        return;
+    }
+
+    delivery.state = DeliveryState::Idle;
+}
+
+fn push_failed_delivery_and_queue(
+    results: &mut Vec<DeliveryResult>,
+    link_id: [u8; 16],
+    delivery: &mut PendingDelivery,
+    reason: &str,
+) {
+    delivery.transfer = None;
+    delivery.remaining_segments.clear();
+    delivery.packet_proof_hash = None;
+    results.push(DeliveryResult::Failed {
+        link_id,
+        msg_hash: delivery.msg_hash,
+        dest_hash: delivery.dest_hash,
+        message: delivery.message.clone(),
+        reason: reason.to_string(),
+    });
+    fail_queued_deliveries(results, link_id, delivery, reason);
+}
+
+fn fail_queued_deliveries(
+    results: &mut Vec<DeliveryResult>,
+    link_id: [u8; 16],
+    delivery: &mut PendingDelivery,
+    reason: &str,
+) {
+    for queued in delivery.queued.drain(..) {
+        results.push(DeliveryResult::Failed {
+            link_id,
+            msg_hash: queued.msg_hash,
+            dest_hash: delivery.dest_hash,
+            message: queued.message,
+            reason: reason.to_string(),
+        });
+    }
+}
+
+fn send_link_identify(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    link_id: &[u8; 16],
+    link: &Link,
+    identity_pub: &[u8; 64],
+    identity_key: &Ed25519PrivateKey,
+) -> bool {
+    let Ok(identify_data) = link.identify(identity_pub, identity_key) else {
+        return false;
+    };
+    let id_header = rns_wire::header::PacketHeader {
+        flags: rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type: rns_wire::flags::DestinationType::Link,
+            packet_type: rns_wire::flags::PacketType::Data,
+        },
+        hops: 0,
+        transport_id: None,
+        destination_hash: *link_id,
+        context: rns_wire::context::PacketContext::LinkIdentify,
+    };
+    let mut id_raw = id_header.pack();
+    id_raw.extend_from_slice(&identify_data);
+    transport_tx
+        .try_send(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(id_raw),
+            destination_hash: *link_id,
+        }))
+        .is_ok()
+}
+
+fn drive_link_action(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    link_id: &[u8; 16],
+    action: LinkAction,
+) -> bool {
+    match action {
+        LinkAction::SendKeepalive => {
+            send_keepalive_packet(transport_tx, link_id);
+            false
+        }
+        LinkAction::TransitionedToStale => {
+            // Python sends one more keepalive when an initiator transitions stale.
+            send_keepalive_packet(transport_tx, link_id);
+            false
+        }
+        LinkAction::SendTeardownAndClose(teardown_data) => {
+            if !teardown_data.is_empty() {
+                send_link_close_payload(transport_tx, link_id, &teardown_data);
+            }
+            true
+        }
+        LinkAction::Closed(_) => true,
+        LinkAction::None => false,
+    }
+}
+
+fn send_keepalive_packet(transport_tx: &mpsc::Sender<TransportMessage>, link_id: &[u8; 16]) {
+    let header = rns_wire::header::PacketHeader {
+        flags: rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type: rns_wire::flags::DestinationType::Link,
+            packet_type: rns_wire::flags::PacketType::Data,
+        },
+        hops: 0,
+        transport_id: None,
+        destination_hash: *link_id,
+        context: rns_wire::context::PacketContext::Keepalive,
+    };
+    let mut raw = header.pack();
+    raw.push(rns_link::constants::KEEPALIVE_REQUEST);
+    let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
+        raw: Bytes::from(raw),
+        destination_hash: *link_id,
+    }));
+}
+
+fn send_link_close_payload(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    link_id: &[u8; 16],
+    teardown_data: &[u8],
+) {
+    let header = rns_wire::header::PacketHeader {
+        flags: rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type: rns_wire::flags::DestinationType::Link,
+            packet_type: rns_wire::flags::PacketType::Data,
+        },
+        hops: 0,
+        transport_id: None,
+        destination_hash: *link_id,
+        context: rns_wire::context::PacketContext::LinkClose,
+    };
+    let mut raw = header.pack();
+    raw.extend_from_slice(teardown_data);
+    let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
+        raw: Bytes::from(raw),
+        destination_hash: *link_id,
+    }));
+}
+
+fn link_data_idle_for(link: &Link) -> Duration {
+    link.no_data_for().min(link.no_outbound_for())
 }
 
 fn build_resource_transfer(
@@ -1155,6 +1562,57 @@ mod tests {
         Bytes::from(raw)
     }
 
+    fn complete_next_link_packet(
+        mgr: &mut LinkDeliveryManager,
+        rx: &mut mpsc::Receiver<TransportMessage>,
+        link_id: [u8; 16],
+        responder_link: &Link,
+        responder_key: &Ed25519PrivateKey,
+    ) {
+        let packet_raw = next_outbound(rx);
+        let (packet_header, _) = rns_wire::header::PacketHeader::unpack(&packet_raw).unwrap();
+        assert_eq!(
+            packet_header.flags.packet_type,
+            rns_wire::flags::PacketType::Data
+        );
+        assert_eq!(
+            packet_header.flags.destination_type,
+            rns_wire::flags::DestinationType::Link
+        );
+        assert_eq!(packet_header.destination_hash, link_id);
+        assert_eq!(
+            packet_header.context,
+            rns_wire::context::PacketContext::None
+        );
+
+        let packet_hash = rns_wire::hash::packet_hash(&packet_raw, packet_header.flags.header_type);
+        let proof_data = responder_link
+            .prove_packet(&packet_hash, responder_key)
+            .unwrap();
+        let proof_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Proof,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut proof_raw = proof_header.pack();
+        proof_raw.extend_from_slice(&proof_data);
+        mgr.event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                raw: proof_raw.into(),
+                interface_id: 0,
+            })
+            .unwrap();
+        mgr.drain_events(&HashMap::new());
+    }
+
     #[test]
     fn test_link_delivery_manager_creation() {
         let (tx, _rx) = mpsc::channel(16);
@@ -1192,6 +1650,167 @@ mod tests {
         let delivery = mgr.pending.get(&link_id).unwrap();
         assert_eq!(delivery.state, DeliveryState::Establishing);
         assert_eq!(delivery.dest_hash, dest_hash);
+    }
+
+    #[test]
+    fn test_direct_delivery_queues_on_pending_link_without_second_link_request() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let dest_hash = [0xCD; 16];
+
+        let first = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "First",
+            "first queued message",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        let second = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Second",
+            "second queued message",
+            crate::constants::DeliveryMethod::Direct,
+        );
+
+        let link_id = mgr.start_delivery(first, dest_hash, 1).unwrap();
+        let reused_link_id = mgr.start_delivery(second, dest_hash, 1).unwrap();
+        assert_eq!(reused_link_id, link_id);
+        assert_eq!(mgr.pending_count(), 2);
+        assert_eq!(mgr.session_count(), 1);
+
+        let register = rx.try_recv().unwrap();
+        assert!(matches!(
+            register,
+            TransportMessage::RegisterDestination { .. }
+        ));
+        let request = rx.try_recv().unwrap();
+        assert!(matches!(request, TransportMessage::Outbound(_)));
+        assert!(
+            rx.try_recv().is_err(),
+            "second message must wait on the cached pending link"
+        );
+
+        if let Some(delivery) = mgr.pending.get_mut(&link_id) {
+            delivery.establishment_timeout = Duration::ZERO;
+        }
+        let results = mgr.tick();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, DeliveryResult::Failed { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(mgr.pending_count(), 0);
+        assert_eq!(mgr.session_count(), 0);
+    }
+
+    #[test]
+    fn test_direct_delivery_reuses_active_link_without_second_link_request() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let responder_key = Ed25519PrivateKey::generate();
+        let sign_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xCE; 16];
+
+        let mut first = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "First",
+            "first direct message",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        first.sign(&sign_key).unwrap();
+        let (link_id, responder_link) =
+            establish_active_delivery(&mut mgr, &mut rx, first, &responder_key, dest_hash);
+
+        assert!(mgr.tick().is_empty());
+        complete_next_link_packet(&mut mgr, &mut rx, link_id, &responder_link, &responder_key);
+        let results = mgr.tick();
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, DeliveryResult::Complete { .. }))
+        );
+        assert_eq!(mgr.pending_count(), 0);
+        assert_eq!(mgr.session_count(), 1);
+        assert_eq!(
+            mgr.pending.get(&link_id).unwrap().state,
+            DeliveryState::Idle
+        );
+
+        let mut second = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Second",
+            "second direct message",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        second.sign(&sign_key).unwrap();
+        let reused_link_id = mgr.start_delivery(second, dest_hash, 1).unwrap();
+        assert_eq!(reused_link_id, link_id);
+        assert!(
+            rx.try_recv().is_err(),
+            "reusing an idle Direct link must not emit a new LINKREQUEST"
+        );
+
+        assert!(mgr.tick().is_empty());
+        complete_next_link_packet(&mut mgr, &mut rx, link_id, &responder_link, &responder_key);
+        let results = mgr.tick();
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, DeliveryResult::Complete { .. }))
+        );
+        assert_eq!(mgr.pending_count(), 0);
+        assert_eq!(mgr.session_count(), 1);
+    }
+
+    #[test]
+    fn test_direct_delivery_identifies_after_success_not_before_packet() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let local_key = Ed25519PrivateKey::generate();
+        let mut local_pub = [0u8; 64];
+        local_pub[32..64].copy_from_slice(&local_key.public_key().to_bytes());
+        let mut mgr = LinkDeliveryManager::new(tx, Some(local_pub), Some(local_key));
+        let responder_key = Ed25519PrivateKey::generate();
+        let sign_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xCF; 16];
+
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Identify",
+            "identify after delivery",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let (link_id, mut responder_link) =
+            establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+
+        assert!(mgr.tick().is_empty());
+        complete_next_link_packet(&mut mgr, &mut rx, link_id, &responder_link, &responder_key);
+        let results = mgr.tick();
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, DeliveryResult::Complete { .. }))
+        );
+
+        let identify_raw = next_outbound(&mut rx);
+        let (identify_header, identify_offset) =
+            rns_wire::header::PacketHeader::unpack(&identify_raw).unwrap();
+        assert_eq!(
+            identify_header.context,
+            rns_wire::context::PacketContext::LinkIdentify
+        );
+        let identified_pub = responder_link
+            .handle_identification(&identify_raw[identify_offset..])
+            .unwrap();
+        assert_eq!(identified_pub, local_pub);
+        assert_eq!(mgr.pending_count(), 0);
+        assert_eq!(mgr.session_count(), 1);
     }
 
     #[test]
