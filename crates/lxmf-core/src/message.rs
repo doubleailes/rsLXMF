@@ -833,6 +833,10 @@ impl LxMessage {
         self.notify_failed();
     }
 
+    pub fn mark_rejected(&mut self) {
+        self.state = MessageState::Rejected;
+    }
+
     pub fn mark_delivered(&mut self) {
         self.state = MessageState::Delivered;
         self.notify_delivered();

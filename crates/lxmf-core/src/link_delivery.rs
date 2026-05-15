@@ -39,6 +39,7 @@ pub enum DeliveryState {
     Transferring,
     AwaitingProof,
     Complete,
+    Rejected,
     Failed,
 }
 
@@ -189,6 +190,46 @@ pub struct DirectLinkStartReport {
     pub in_flight_deliveries: usize,
 }
 
+/// Which link-delivery path emitted an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LxmfDeliveryEventMethod {
+    Direct,
+    PropagationDeposit,
+}
+
+/// Semantic delivery stages surfaced by [`LinkDeliveryManager`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LxmfDeliveryEventKind {
+    LinkEstablishing,
+    LinkEstablished,
+    DirectLinkPending,
+    DirectLinkReused,
+    TransferStarted,
+    TransferProgress,
+    AwaitingProof,
+    Delivered,
+    Rejected,
+    Failed,
+}
+
+/// Upstream-like delivery progress event for embedders and UI adapters.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LxmfDeliveryEvent {
+    pub kind: LxmfDeliveryEventKind,
+    pub method: LxmfDeliveryEventMethod,
+    pub link_id: [u8; 16],
+    pub dest_hash: [u8; 16],
+    pub msg_hash: Option<[u8; 32]>,
+    pub attempts: u32,
+    pub progress: Option<f64>,
+    pub representation: DeliveryRepresentation,
+    pub link_state: LinkState,
+    pub delivery_state: DeliveryState,
+    pub queued_deliveries: usize,
+    pub in_flight_deliveries: usize,
+    pub reason: Option<String>,
+}
+
 /// Snapshot of a reusable Direct Link session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectLinkSnapshot {
@@ -241,6 +282,7 @@ pub struct LinkDeliveryManager {
     identity_key: Option<Ed25519PrivateKey>,
     event_tx: mpsc::Sender<DestinationEvent>,
     event_rx: mpsc::Receiver<DestinationEvent>,
+    delivery_events: VecDeque<LxmfDeliveryEvent>,
 }
 
 impl LinkDeliveryManager {
@@ -258,6 +300,7 @@ impl LinkDeliveryManager {
             identity_key,
             event_tx,
             event_rx,
+            delivery_events: VecDeque::new(),
         }
     }
 
@@ -315,6 +358,8 @@ impl LinkDeliveryManager {
             if let Some(delivery) = self.pending.get_mut(&link_id)
                 && delivery.reusable
             {
+                let msg_hash = message.hash;
+                let attempts = message.delivery_attempts;
                 let state = delivery.state;
                 let link_state = delivery.link.state;
                 let kind = if state == DeliveryState::Idle && delivery.link.is_active() {
@@ -334,7 +379,7 @@ impl LinkDeliveryManager {
                     pending_count = delivery.active_delivery_count(),
                     "reusing cached Direct link delivery session"
                 );
-                return Ok(DirectLinkStartReport {
+                let report = DirectLinkStartReport {
                     link_id,
                     dest_hash,
                     kind,
@@ -342,15 +387,45 @@ impl LinkDeliveryManager {
                     delivery_state: delivery.state,
                     queued_deliveries: delivery.queued.len(),
                     in_flight_deliveries: usize::from(delivery.state != DeliveryState::Idle),
+                };
+                self.delivery_events.push_back(LxmfDeliveryEvent {
+                    kind: match kind {
+                        DirectLinkStartKind::ReusedActiveDirect => {
+                            LxmfDeliveryEventKind::DirectLinkReused
+                        }
+                        DirectLinkStartKind::QueuedOnDirect => {
+                            LxmfDeliveryEventKind::DirectLinkPending
+                        }
+                        DirectLinkStartKind::NewDirect => LxmfDeliveryEventKind::LinkEstablishing,
+                    },
+                    method: LxmfDeliveryEventMethod::Direct,
+                    link_id,
+                    dest_hash,
+                    msg_hash,
+                    attempts,
+                    progress: Some(if link_state == LinkState::Active {
+                        0.05
+                    } else {
+                        0.03
+                    }),
+                    representation: DeliveryRepresentation::Unknown,
+                    link_state: report.link_state,
+                    delivery_state: report.delivery_state,
+                    queued_deliveries: report.queued_deliveries,
+                    in_flight_deliveries: report.in_flight_deliveries,
+                    reason: None,
                 });
+                return Ok(report);
             }
 
             self.direct_links.remove(&dest_hash);
         }
 
+        let msg_hash = message.hash;
+        let attempts = message.delivery_attempts;
         let link_id = self.start_delivery_inner(message, dest_hash, hops, None, true, true)?;
         let snapshot = self.direct_link_snapshot(dest_hash);
-        Ok(DirectLinkStartReport {
+        let report = DirectLinkStartReport {
             link_id,
             dest_hash,
             kind: DirectLinkStartKind::NewDirect,
@@ -360,7 +435,23 @@ impl LinkDeliveryManager {
                 .unwrap_or(DeliveryState::Establishing),
             queued_deliveries: 0,
             in_flight_deliveries: 1,
-        })
+        };
+        self.delivery_events.push_back(LxmfDeliveryEvent {
+            kind: LxmfDeliveryEventKind::LinkEstablishing,
+            method: LxmfDeliveryEventMethod::Direct,
+            link_id,
+            dest_hash,
+            msg_hash,
+            attempts,
+            progress: Some(0.03),
+            representation: DeliveryRepresentation::Unknown,
+            link_state: report.link_state,
+            delivery_state: report.delivery_state,
+            queued_deliveries: report.queued_deliveries,
+            in_flight_deliveries: report.in_flight_deliveries,
+            reason: None,
+        });
+        Ok(report)
     }
 
     fn start_delivery_inner(
@@ -753,7 +844,13 @@ impl LinkDeliveryManager {
                         queued = delivery.queued.len(),
                         "link delivery timed out"
                     );
-                    push_failed_delivery_and_queue(&mut results, *link_id, delivery, reason);
+                    push_failed_delivery_and_queue(
+                        &mut results,
+                        &mut self.delivery_events,
+                        *link_id,
+                        delivery,
+                        reason,
+                    );
                     remove_session = true;
                 }
             }
@@ -794,6 +891,16 @@ impl LinkDeliveryManager {
                         // One-shot propagation links keep the previous pre-transfer
                         // identify behavior for compatibility with existing callers.
                         delivery.state = DeliveryState::Transferring;
+                        if delivery.message.progress < 0.05 {
+                            delivery.message.progress = 0.05;
+                        }
+                        self.delivery_events.push_back(delivery_event(
+                            LxmfDeliveryEventKind::LinkEstablished,
+                            *link_id,
+                            delivery,
+                            Some(0.05),
+                            None,
+                        ));
 
                         let packed = if let Some(ref packed) = delivery.packed_override {
                             Ok(packed.clone())
@@ -819,6 +926,14 @@ impl LinkDeliveryManager {
                                     Some(packet_hash) => {
                                         delivery.packet_proof_hash = Some(packet_hash);
                                         delivery.state = DeliveryState::AwaitingProof;
+                                        delivery.message.progress = 0.50;
+                                        self.delivery_events.push_back(delivery_event(
+                                            LxmfDeliveryEventKind::AwaitingProof,
+                                            *link_id,
+                                            delivery,
+                                            Some(0.50),
+                                            None,
+                                        ));
                                     }
                                     None => {
                                         delivery.state = DeliveryState::Failed;
@@ -848,6 +963,14 @@ impl LinkDeliveryManager {
                                     Ok((transfer, remaining_segments)) => {
                                         delivery.transfer = Some(transfer);
                                         delivery.remaining_segments = remaining_segments;
+                                        delivery.message.progress = 0.10;
+                                        self.delivery_events.push_back(delivery_event(
+                                            LxmfDeliveryEventKind::TransferStarted,
+                                            *link_id,
+                                            delivery,
+                                            Some(0.10),
+                                            None,
+                                        ));
                                     }
                                     Err(e) => {
                                         let _ = e;
@@ -876,6 +999,14 @@ impl LinkDeliveryManager {
                                 ActionOutcome::Continue => continue,
                                 ActionOutcome::Break => break,
                                 ActionOutcome::Complete => {
+                                    delivery.message.progress = 1.0;
+                                    self.delivery_events.push_back(delivery_event(
+                                        LxmfDeliveryEventKind::Delivered,
+                                        *link_id,
+                                        delivery,
+                                        Some(1.0),
+                                        None,
+                                    ));
                                     results.push(DeliveryResult::Complete {
                                         link_id: *link_id,
                                         msg_hash: delivery.msg_hash,
@@ -892,6 +1023,7 @@ impl LinkDeliveryManager {
                                     } else {
                                         fail_queued_deliveries(
                                             &mut results,
+                                            &mut self.delivery_events,
                                             *link_id,
                                             delivery,
                                             "link closed",
@@ -902,6 +1034,7 @@ impl LinkDeliveryManager {
                                 ActionOutcome::Fail(reason) => {
                                     push_failed_delivery_and_queue(
                                         &mut results,
+                                        &mut self.delivery_events,
                                         *link_id,
                                         delivery,
                                         &reason,
@@ -912,6 +1045,14 @@ impl LinkDeliveryManager {
                         }
                     }
                     DeliveryState::Complete => {
+                        delivery.message.progress = 1.0;
+                        self.delivery_events.push_back(delivery_event(
+                            LxmfDeliveryEventKind::Delivered,
+                            *link_id,
+                            delivery,
+                            Some(1.0),
+                            None,
+                        ));
                         results.push(DeliveryResult::Complete {
                             link_id: *link_id,
                             msg_hash: delivery.msg_hash,
@@ -925,7 +1066,45 @@ impl LinkDeliveryManager {
                                 delivery,
                             );
                         } else {
-                            fail_queued_deliveries(&mut results, *link_id, delivery, "link closed");
+                            fail_queued_deliveries(
+                                &mut results,
+                                &mut self.delivery_events,
+                                *link_id,
+                                delivery,
+                                "link closed",
+                            );
+                            remove_session = true;
+                        }
+                    }
+                    DeliveryState::Rejected => {
+                        let reason = delivery
+                            .failure_reason
+                            .take()
+                            .unwrap_or_else(|| "resource rejected".to_string());
+                        self.delivery_events.push_back(delivery_event(
+                            LxmfDeliveryEventKind::Rejected,
+                            *link_id,
+                            delivery,
+                            Some(delivery.message.progress),
+                            Some(reason.clone()),
+                        ));
+                        results.push(DeliveryResult::Rejected {
+                            link_id: *link_id,
+                            msg_hash: delivery.msg_hash,
+                            dest_hash: delivery.dest_hash,
+                            message: delivery.message.clone(),
+                            reason,
+                        });
+                        if delivery.reusable && delivery.link.state != LinkState::Closed {
+                            finish_unsuccessful_reusable_delivery(delivery);
+                        } else {
+                            fail_queued_deliveries(
+                                &mut results,
+                                &mut self.delivery_events,
+                                *link_id,
+                                delivery,
+                                "link closed",
+                            );
                             remove_session = true;
                         }
                     }
@@ -934,7 +1113,13 @@ impl LinkDeliveryManager {
                             .failure_reason
                             .take()
                             .unwrap_or_else(|| "delivery failed".to_string());
-                        push_failed_delivery_and_queue(&mut results, *link_id, delivery, &reason);
+                        push_failed_delivery_and_queue(
+                            &mut results,
+                            &mut self.delivery_events,
+                            *link_id,
+                            delivery,
+                            &reason,
+                        );
                         remove_session = true;
                     }
                     DeliveryState::Establishing | DeliveryState::AwaitingProof => {}
@@ -943,7 +1128,13 @@ impl LinkDeliveryManager {
 
             if !remove_session && delivery.reusable {
                 if delivery.link.state == LinkState::Closed {
-                    fail_queued_deliveries(&mut results, *link_id, delivery, "link closed");
+                    fail_queued_deliveries(
+                        &mut results,
+                        &mut self.delivery_events,
+                        *link_id,
+                        delivery,
+                        "link closed",
+                    );
                     remove_session = true;
                 } else if delivery.state == DeliveryState::Idle
                     && delivery.queued.is_empty()
@@ -965,12 +1156,19 @@ impl LinkDeliveryManager {
                     ) {
                         push_failed_delivery_and_queue(
                             &mut results,
+                            &mut self.delivery_events,
                             *link_id,
                             delivery,
                             "link closed",
                         );
                     } else {
-                        fail_queued_deliveries(&mut results, *link_id, delivery, "link closed");
+                        fail_queued_deliveries(
+                            &mut results,
+                            &mut self.delivery_events,
+                            *link_id,
+                            delivery,
+                            "link closed",
+                        );
                     }
                     remove_session = true;
                 }
@@ -997,10 +1195,28 @@ impl LinkDeliveryManager {
     }
 
     pub fn handle_hmu(&mut self, link_id: &[u8; 16], hmu_data: &[u8]) {
-        if let Some(delivery) = self.pending.get_mut(link_id)
+        let event = if let Some(delivery) = self.pending.get_mut(link_id)
             && let Some(ref mut transfer) = delivery.transfer
         {
             transfer.handle_hmu(hmu_data);
+            let progress = delivery_resource_progress(delivery);
+            if let Some(progress) = progress {
+                delivery.message.progress = progress;
+            }
+            progress.map(|progress| {
+                delivery_event(
+                    LxmfDeliveryEventKind::TransferProgress,
+                    *link_id,
+                    delivery,
+                    Some(progress),
+                    None,
+                )
+            })
+        } else {
+            None
+        };
+        if let Some(event) = event {
+            self.delivery_events.push_back(event);
         }
     }
 
@@ -1010,34 +1226,62 @@ impl LinkDeliveryManager {
     /// `SendPart` actions immediately rather than waiting for the next [`Self::tick`], since
     /// the receiver may time out and retry first.
     pub fn handle_request(&mut self, link_id: &[u8; 16], request_data: &[u8]) {
-        let Some(delivery) = self.pending.get_mut(link_id) else {
-            return;
-        };
-        let Some(ref mut transfer) = delivery.transfer else {
-            return;
-        };
-        let actions = transfer.handle_request(request_data);
-        for action in actions {
-            match dispatch_action(link_id, delivery, &self.transport_tx, action) {
-                ActionOutcome::Continue | ActionOutcome::Break => {}
-                ActionOutcome::Complete => {
-                    break;
-                }
-                ActionOutcome::Fail(reason) => {
-                    delivery.failure_reason = Some(reason);
-                    // Terminal state is surfaced on the next tick() via delivery.state.
-                    break;
+        let event = {
+            let Some(delivery) = self.pending.get_mut(link_id) else {
+                return;
+            };
+            let Some(ref mut transfer) = delivery.transfer else {
+                return;
+            };
+            let actions = transfer.handle_request(request_data);
+            for action in actions {
+                match dispatch_action(link_id, delivery, &self.transport_tx, action) {
+                    ActionOutcome::Continue | ActionOutcome::Break => {}
+                    ActionOutcome::Complete => {
+                        break;
+                    }
+                    ActionOutcome::Fail(reason) => {
+                        delivery.failure_reason = Some(reason);
+                        // Terminal state is surfaced on the next tick() via delivery.state.
+                        break;
+                    }
                 }
             }
+            let progress = delivery_resource_progress(delivery);
+            if let Some(progress) = progress {
+                delivery.message.progress = progress;
+            }
+            progress.map(|progress| {
+                delivery_event(
+                    LxmfDeliveryEventKind::TransferProgress,
+                    *link_id,
+                    delivery,
+                    Some(progress),
+                    None,
+                )
+            })
+        };
+        if let Some(event) = event {
+            self.delivery_events.push_back(event);
         }
     }
 
     /// Apply an inbound resource proof; returns `true` when the proof was accepted.
     pub fn handle_resource_proof(&mut self, link_id: &[u8; 16], proof_data: &[u8]) -> bool {
-        if let Some(delivery) = self.pending.get_mut(link_id)
+        let mut event = None;
+        let accepted = if let Some(delivery) = self.pending.get_mut(link_id)
             && let Some(ref mut transfer) = delivery.transfer
             && transfer.handle_proof(proof_data)
         {
+            let progress = delivery_resource_proof_progress(delivery).unwrap_or(1.0);
+            delivery.message.progress = progress;
+            event = Some(delivery_event(
+                LxmfDeliveryEventKind::TransferProgress,
+                *link_id,
+                delivery,
+                Some(progress),
+                None,
+            ));
             if delivery.remaining_segments.is_empty() {
                 delivery.state = DeliveryState::Complete;
             } else {
@@ -1046,9 +1290,14 @@ impl LinkDeliveryManager {
                 delivery.transfer = Some(OutboundTransfer::from_prebuilt(next_segment, rtt));
                 delivery.state = DeliveryState::Transferring;
             }
-            return true;
+            true
+        } else {
+            false
+        };
+        if let Some(event) = event {
+            self.delivery_events.push_back(event);
         }
-        false
+        accepted
     }
 
     /// Apply an inbound receiver-cancel/reject for the current outbound resource.
@@ -1066,7 +1315,8 @@ impl LinkDeliveryManager {
         {
             transfer.handle_cancel();
             delivery.remaining_segments.clear();
-            delivery.state = DeliveryState::Failed;
+            delivery.message.mark_rejected();
+            delivery.state = DeliveryState::Rejected;
             delivery.failure_reason = Some("resource rejected".to_string());
             return true;
         }
@@ -1131,6 +1381,10 @@ impl LinkDeliveryManager {
             .sum()
     }
 
+    pub fn take_delivery_events(&mut self) -> Vec<LxmfDeliveryEvent> {
+        self.delivery_events.drain(..).collect()
+    }
+
     pub fn delivery_link_available(&self, dest_hash: &[u8; 16]) -> bool {
         self.direct_links
             .get(dest_hash)
@@ -1183,6 +1437,74 @@ impl LinkDeliveryManager {
     }
 }
 
+fn delivery_event(
+    kind: LxmfDeliveryEventKind,
+    link_id: [u8; 16],
+    delivery: &PendingDelivery,
+    progress: Option<f64>,
+    reason: Option<String>,
+) -> LxmfDeliveryEvent {
+    LxmfDeliveryEvent {
+        kind,
+        method: if delivery.reusable {
+            LxmfDeliveryEventMethod::Direct
+        } else {
+            LxmfDeliveryEventMethod::PropagationDeposit
+        },
+        link_id,
+        dest_hash: delivery.dest_hash,
+        msg_hash: delivery.msg_hash,
+        attempts: delivery.message.delivery_attempts,
+        progress,
+        representation: delivery.message.representation,
+        link_state: delivery.link.state,
+        delivery_state: delivery.state,
+        queued_deliveries: delivery.queued.len(),
+        in_flight_deliveries: usize::from(delivery.state != DeliveryState::Idle),
+        reason,
+    }
+}
+
+fn queued_delivery_event(
+    kind: LxmfDeliveryEventKind,
+    link_id: [u8; 16],
+    dest_hash: [u8; 16],
+    queued: &QueuedDelivery,
+    reason: Option<String>,
+) -> LxmfDeliveryEvent {
+    LxmfDeliveryEvent {
+        kind,
+        method: LxmfDeliveryEventMethod::Direct,
+        link_id,
+        dest_hash,
+        msg_hash: queued.msg_hash,
+        attempts: queued.message.delivery_attempts,
+        progress: Some(queued.message.progress),
+        representation: queued.message.representation,
+        link_state: LinkState::Closed,
+        delivery_state: DeliveryState::Failed,
+        queued_deliveries: 0,
+        in_flight_deliveries: 0,
+        reason,
+    }
+}
+
+fn delivery_resource_progress(delivery: &PendingDelivery) -> Option<f64> {
+    let transfer = delivery.transfer.as_ref()?;
+    let total_segments = transfer.resource.total_segments.max(1);
+    let completed_segments = transfer.resource.segment_index.saturating_sub(1);
+    let aggregate = (completed_segments as f64 + transfer.progress()) / total_segments as f64;
+    Some((0.10 + aggregate * 0.90).clamp(0.10, 1.0))
+}
+
+fn delivery_resource_proof_progress(delivery: &PendingDelivery) -> Option<f64> {
+    let transfer = delivery.transfer.as_ref()?;
+    let total_segments = transfer.resource.total_segments.max(1);
+    let completed_segments = transfer.resource.segment_index.min(total_segments);
+    let aggregate = completed_segments as f64 / total_segments as f64;
+    Some((0.10 + aggregate * 0.90).clamp(0.10, 1.0))
+}
+
 fn finish_reusable_delivery(
     transport_tx: &mpsc::Sender<TransportMessage>,
     identity_pub: &Option<[u8; 64]>,
@@ -1209,8 +1531,22 @@ fn finish_reusable_delivery(
     delivery.state = DeliveryState::Idle;
 }
 
+fn finish_unsuccessful_reusable_delivery(delivery: &mut PendingDelivery) {
+    delivery.transfer = None;
+    delivery.remaining_segments.clear();
+    delivery.packet_proof_hash = None;
+    delivery.failure_reason = None;
+
+    if delivery.link.is_active() && delivery.start_queued_delivery() {
+        return;
+    }
+
+    delivery.state = DeliveryState::Idle;
+}
+
 fn push_failed_delivery_and_queue(
     results: &mut Vec<DeliveryResult>,
+    events: &mut VecDeque<LxmfDeliveryEvent>,
     link_id: [u8; 16],
     delivery: &mut PendingDelivery,
     reason: &str,
@@ -1218,6 +1554,13 @@ fn push_failed_delivery_and_queue(
     delivery.transfer = None;
     delivery.remaining_segments.clear();
     delivery.packet_proof_hash = None;
+    events.push_back(delivery_event(
+        LxmfDeliveryEventKind::Failed,
+        link_id,
+        delivery,
+        Some(delivery.message.progress),
+        Some(reason.to_string()),
+    ));
     results.push(DeliveryResult::Failed {
         link_id,
         msg_hash: delivery.msg_hash,
@@ -1225,16 +1568,24 @@ fn push_failed_delivery_and_queue(
         message: delivery.message.clone(),
         reason: reason.to_string(),
     });
-    fail_queued_deliveries(results, link_id, delivery, reason);
+    fail_queued_deliveries(results, events, link_id, delivery, reason);
 }
 
 fn fail_queued_deliveries(
     results: &mut Vec<DeliveryResult>,
+    events: &mut VecDeque<LxmfDeliveryEvent>,
     link_id: [u8; 16],
     delivery: &mut PendingDelivery,
     reason: &str,
 ) {
     for queued in delivery.queued.drain(..) {
+        events.push_back(queued_delivery_event(
+            LxmfDeliveryEventKind::Failed,
+            link_id,
+            delivery.dest_hash,
+            &queued,
+            Some(reason.to_string()),
+        ));
         results.push(DeliveryResult::Failed {
             link_id,
             msg_hash: queued.msg_hash,
@@ -1398,6 +1749,13 @@ pub enum DeliveryResult {
     Complete {
         link_id: [u8; 16],
         msg_hash: Option<[u8; 32]>,
+    },
+    Rejected {
+        link_id: [u8; 16],
+        msg_hash: Option<[u8; 32]>,
+        dest_hash: [u8; 16],
+        message: LxMessage,
+        reason: String,
     },
     Failed {
         link_id: [u8; 16],
@@ -1774,6 +2132,13 @@ mod tests {
         assert!(mgr.delivery_link_available(&dest_hash));
         assert_eq!(mgr.stats().direct_sessions, 1);
         assert_eq!(mgr.stats().one_shot_sessions, 0);
+        let events = mgr.take_delivery_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, LxmfDeliveryEventKind::LinkEstablishing);
+        assert_eq!(events[0].method, LxmfDeliveryEventMethod::Direct);
+        assert_eq!(events[0].link_id, link_id);
+        assert_eq!(events[0].dest_hash, dest_hash);
+        assert_eq!(events[0].progress, Some(0.03));
 
         let register = rx.try_recv();
         assert!(register.is_ok(), "RegisterDestination should be queued");
@@ -2130,9 +2495,17 @@ mod tests {
         let dest_hash = [0xCC; 16];
         let (link_id, _responder_link) =
             establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+        let _ = mgr.take_delivery_events();
 
         let results = mgr.tick();
         assert!(results.is_empty());
+        let events = mgr.take_delivery_events();
+        assert!(events.iter().any(|event| {
+            event.kind == LxmfDeliveryEventKind::LinkEstablished && event.progress == Some(0.05)
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == LxmfDeliveryEventKind::TransferStarted && event.progress == Some(0.10)
+        }));
 
         let delivery = mgr.pending.get(&link_id).unwrap();
         let transfer = delivery.transfer.as_ref().expect("first segment transfer");
@@ -2164,9 +2537,11 @@ mod tests {
         let dest_hash = [0xCC; 16];
         let (link_id, _responder_link) =
             establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+        let _ = mgr.take_delivery_events();
 
         let results = mgr.tick();
         assert!(results.is_empty());
+        let _ = mgr.take_delivery_events();
 
         let first_proof = {
             let delivery = mgr.pending.get(&link_id).unwrap();
@@ -2178,6 +2553,13 @@ mod tests {
             proof
         };
         assert!(mgr.handle_resource_proof(&link_id, &first_proof));
+        let events = mgr.take_delivery_events();
+        let progress = events
+            .iter()
+            .find(|event| event.kind == LxmfDeliveryEventKind::TransferProgress)
+            .and_then(|event| event.progress)
+            .expect("resource proof emits transfer progress");
+        assert!(progress > 0.10 && progress < 1.0);
 
         let delivery = mgr.pending.get(&link_id).unwrap();
         assert_eq!(delivery.state, DeliveryState::Transferring);
@@ -2213,7 +2595,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_reject_fails_delivery() {
+    fn test_resource_reject_marks_delivery_rejected_without_retry() {
         let (tx, mut rx) = mpsc::channel(512);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
@@ -2250,9 +2632,20 @@ mod tests {
         assert!(
             results
                 .iter()
-                .any(|r| matches!(r, DeliveryResult::Failed { .. }))
+                .any(|r| matches!(r, DeliveryResult::Rejected { .. }))
         );
         assert_eq!(mgr.pending_count(), 0);
+        assert_eq!(
+            mgr.pending.get(&link_id).unwrap().state,
+            DeliveryState::Idle
+        );
+        let events = mgr.take_delivery_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == LxmfDeliveryEventKind::Rejected
+                    && event.reason.as_deref() == Some("resource rejected"))
+        );
     }
 
     #[test]
@@ -2358,11 +2751,19 @@ mod tests {
 
         let responder_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xCC; 16];
-        let (link_id, mut responder_link) =
+        let (link_id, responder_link) =
             establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+        let _ = mgr.take_delivery_events();
 
         let results = mgr.tick();
         assert!(results.is_empty());
+        let events = mgr.take_delivery_events();
+        assert!(events.iter().any(|event| {
+            event.kind == LxmfDeliveryEventKind::LinkEstablished && event.progress == Some(0.05)
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == LxmfDeliveryEventKind::AwaitingProof && event.progress == Some(0.50)
+        }));
 
         let packet_raw = next_outbound(&mut rx);
         let (packet_header, packet_offset) =
@@ -2414,6 +2815,42 @@ mod tests {
                 interface_id: 0,
             })
             .unwrap();
+        mgr.drain_events(&HashMap::new());
+        let results = mgr.tick();
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, DeliveryResult::Complete { .. }))
+        );
+        let events = mgr.take_delivery_events();
+        assert!(events.iter().any(|event| {
+            event.kind == LxmfDeliveryEventKind::Delivered && event.progress == Some(1.0)
+        }));
+    }
+
+    #[test]
+    fn test_small_direct_ignores_unauthenticated_close_after_proof() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Small Direct",
+            "fits in one link packet",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+
+        let responder_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xCC; 16];
+        let (link_id, mut responder_link) =
+            establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+
+        let results = mgr.tick();
+        assert!(results.is_empty());
+        complete_next_link_packet(&mut mgr, &mut rx, link_id, &responder_link, &responder_key);
         let close_body = responder_link
             .teardown(CloseReason::InitiatorClosed)
             .expect("remote active link emits authenticated teardown after proof");

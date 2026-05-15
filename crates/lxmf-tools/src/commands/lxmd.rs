@@ -1154,6 +1154,22 @@ impl LxmdRunner {
                             tracing::info!(hash = %hex::encode(hash), "link delivery complete");
                         }
                     }
+                    lxmf_core::link_delivery::DeliveryResult::Rejected {
+                        msg_hash,
+                        dest_hash,
+                        reason,
+                        ..
+                    } => {
+                        tracing::warn!(
+                            dest = %hex::encode(dest_hash),
+                            reason = %reason,
+                            "link delivery rejected"
+                        );
+                        if let Some(hash) = msg_hash {
+                            let _ = self.router.mark_outbound_rejected(&hash);
+                        }
+                        self.link_delivery_failures.push(reason);
+                    }
                     lxmf_core::link_delivery::DeliveryResult::Failed {
                         msg_hash,
                         dest_hash,

@@ -751,6 +751,22 @@ impl LxmRouter {
         true
     }
 
+    /// Mark a pending outbound message rejected and remove it from the
+    /// outbound queue.
+    pub fn mark_outbound_rejected(&mut self, message_hash: &[u8; 32]) -> bool {
+        let Some(pos) = self
+            .pending_outbound
+            .iter()
+            .position(|m| m.hash.as_ref() == Some(message_hash))
+        else {
+            return false;
+        };
+
+        let mut msg = self.pending_outbound.remove(pos);
+        msg.mark_rejected();
+        true
+    }
+
     /// Re-arm a pending outbound message after a path request without adding a
     /// duplicate queue entry.
     pub fn defer_outbound_for_path_request(&mut self, message_hash: &[u8; 32], now: f64) -> bool {
