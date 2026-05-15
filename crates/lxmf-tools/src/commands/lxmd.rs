@@ -15,7 +15,10 @@ use std::sync::{Arc, Mutex};
 use lxmf_core::constants::{DELIVERY_RETRY_WAIT, MAX_DELIVERY_ATTEMPTS, PATH_REQUEST_WAIT};
 use lxmf_core::message::LxMessage;
 use lxmf_core::propagation_node::{PropagationNode, PropagationNodeConfig};
-use lxmf_core::router::{LxmRouter, OutboundAction};
+use lxmf_core::router::{
+    DirectDeliveryPlan, DirectDeliveryPlanInput, DirectReusableLinkState, DirectRouteSnapshot,
+    LxmRouter, OutboundAction, plan_direct_delivery,
+};
 use lxmf_tools::daemon::{DaemonConfig, create_router_with_transport, execute_on_inbound};
 use lxmf_tools::lxmd_cli::{
     Args, example_config, load_hash_list, normalize_hash_hex, parse_destination_hash,
@@ -37,7 +40,7 @@ use rns_identity::identity::Identity;
 use rns_identity::ratchet::{
     RatchetRing, ReceivedRatchet, clean_received_ratchets_dir, purge_expired_ratchets_in_memory,
 };
-use rns_transport::messages::{AnnounceHandlerEvent, TransportMessage};
+use rns_transport::messages::{AnnounceHandlerEvent, TransportMessage, TransportQuery};
 
 const LXMF_APP_NAME: &str = "lxmf.delivery";
 
@@ -92,6 +95,39 @@ fn mark_delivery_attempt(message: &mut LxMessage) -> u32 {
     message.delivery_attempts
 }
 
+fn queue_path_request(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    request_hash: [u8; 16],
+    drop_existing: bool,
+    reason: &str,
+) {
+    if drop_existing {
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        if let Err(e) = transport_tx.try_send(TransportMessage::Rpc {
+            query: TransportQuery::DropPath { dest: request_hash },
+            response_tx,
+        }) {
+            tracing::warn!(
+                dest = %hex::encode(request_hash),
+                error = %e,
+                reason,
+                "failed to queue path drop before LXMF retry"
+            );
+        }
+    }
+
+    if let Err(e) = transport_tx.try_send(TransportMessage::RequestPath {
+        destination_hash: request_hash,
+    }) {
+        tracing::warn!(
+            dest = %hex::encode(request_hash),
+            error = %e,
+            reason,
+            "failed to queue path request before LXMF retry"
+        );
+    }
+}
+
 fn requeue_after_path_request(
     router: &mut LxmRouter,
     transport_tx: &mpsc::Sender<TransportMessage>,
@@ -106,16 +142,7 @@ fn requeue_after_path_request(
     }
     message.last_delivery_attempt = now;
     message.next_delivery_attempt = now + PATH_REQUEST_WAIT as f64;
-    if let Err(e) = transport_tx.try_send(TransportMessage::RequestPath {
-        destination_hash: request_hash,
-    }) {
-        tracing::warn!(
-            dest = %hex::encode(request_hash),
-            error = %e,
-            reason,
-            "failed to queue path request before LXMF retry"
-        );
-    }
+    queue_path_request(transport_tx, request_hash, false, reason);
     tracing::warn!(
         dest = %hex::encode(message.destination_hash),
         request_dest = %hex::encode(request_hash),
@@ -135,6 +162,33 @@ fn link_failure_retryable(reason: &str) -> bool {
 
 fn route_hops_for(route_hops: &HashMap<[u8; 16], u8>, dest_hash: [u8; 16]) -> u8 {
     route_hops.get(&dest_hash).copied().unwrap_or(1).max(1)
+}
+
+fn direct_route_snapshot(
+    route_hops: &HashMap<[u8; 16], u8>,
+    dest_hash: [u8; 16],
+) -> Option<DirectRouteSnapshot> {
+    route_hops
+        .get(&dest_hash)
+        .copied()
+        .map(|hops| DirectRouteSnapshot::new(dest_hash, hops))
+}
+
+fn direct_reusable_link_state(
+    link_delivery: Option<&lxmf_core::link_delivery::LinkDeliveryManager>,
+    dest_hash: [u8; 16],
+) -> DirectReusableLinkState {
+    let Some(snapshot) = link_delivery.and_then(|ld| ld.direct_link_snapshot(dest_hash)) else {
+        return DirectReusableLinkState::None;
+    };
+
+    match snapshot.delivery_state {
+        lxmf_core::link_delivery::DeliveryState::Idle => DirectReusableLinkState::Active,
+        lxmf_core::link_delivery::DeliveryState::Failed => {
+            DirectReusableLinkState::Closed { activated: false }
+        }
+        _ => DirectReusableLinkState::Pending,
+    }
 }
 
 fn create_control_announce_packet(
@@ -1699,55 +1753,91 @@ impl LxmdRunner {
 
             let dest_hex = hex::encode(dest_hash);
             if !is_opportunistic {
-                if !self.known_identities.contains_key(&dest_hex) {
-                    tracing::warn!(
-                        dest = %dest_hex,
-                        attempts = message.delivery_attempts,
-                        "destination key unknown, re-queuing direct link delivery"
-                    );
-                    requeue_after_path_request(
-                        &mut self.router,
-                        &self.transport_tx,
-                        message,
-                        dest_hash,
-                        "destination identity unknown",
-                        true,
-                    );
-                    continue;
-                }
-
-                let attempts = mark_delivery_attempt(&mut message);
-                if attempts >= MAX_DELIVERY_ATTEMPTS {
-                    tracing::warn!(
-                        dest = %dest_hex,
-                        attempts,
-                        max_attempts = MAX_DELIVERY_ATTEMPTS,
-                        "direct delivery attempt budget reached; deferring terminal failure"
-                    );
-                    self.router.send(message);
-                    continue;
-                }
-                tracing::info!(
-                    dest = %dest_hex,
-                    "routing Direct LXMF message over link delivery"
-                );
-                let hops = route_hops_for(&self.route_hops, dest_hash);
-                self.ensure_link_delivery();
-                if let Some(ref mut ld) = self.link_delivery {
-                    if let Err(err) = ld.start_delivery(message, dest_hash, hops) {
-                        let reason = err.error.to_string();
-                        tracing::warn!(
-                            error = %reason,
-                            dest = %dest_hex,
-                            "failed to start direct link delivery"
-                        );
-                        requeue_after_path_request(
-                            &mut self.router,
-                            &self.transport_tx,
-                            err.message,
+                let plan = plan_direct_delivery(
+                    &mut message,
+                    DirectDeliveryPlanInput {
+                        identity_known: self.known_identities.contains_key(&dest_hex),
+                        route: direct_route_snapshot(&self.route_hops, dest_hash),
+                        reusable_link: direct_reusable_link_state(
+                            self.link_delivery.as_ref(),
                             dest_hash,
-                            &reason,
-                            false,
+                        ),
+                    },
+                    now_f64(),
+                );
+
+                match plan {
+                    DirectDeliveryPlan::RequestPath { drop_existing } => {
+                        queue_path_request(
+                            &self.transport_tx,
+                            dest_hash,
+                            drop_existing,
+                            "direct delivery path request",
+                        );
+                        tracing::warn!(
+                            dest = %dest_hex,
+                            attempts = message.delivery_attempts,
+                            drop_existing,
+                            "direct delivery waiting for path"
+                        );
+                        self.router.send(message);
+                    }
+                    DirectDeliveryPlan::DeferTerminalFailure => {
+                        tracing::warn!(
+                            dest = %dest_hex,
+                            attempts = message.delivery_attempts,
+                            max_attempts = MAX_DELIVERY_ATTEMPTS,
+                            "direct delivery attempt budget reached; deferring terminal failure"
+                        );
+                        self.router.send(message);
+                    }
+                    DirectDeliveryPlan::WaitForReusableLink => {
+                        tracing::debug!(
+                            dest = %dest_hex,
+                            attempts = message.delivery_attempts,
+                            "direct delivery waiting for reusable Link"
+                        );
+                        self.router.send(message);
+                    }
+                    DirectDeliveryPlan::UseReusableLink
+                    | DirectDeliveryPlan::StartNewLink { .. } => {
+                        let planned_hops = match plan {
+                            DirectDeliveryPlan::StartNewLink { hops } => hops,
+                            _ => route_hops_for(&self.route_hops, dest_hash),
+                        };
+                        tracing::info!(
+                            dest = %dest_hex,
+                            hops = planned_hops,
+                            plan = ?plan,
+                            "routing Direct LXMF message over link delivery"
+                        );
+                        self.ensure_link_delivery();
+                        if let Some(ref mut ld) = self.link_delivery {
+                            if let Err(err) =
+                                ld.start_delivery_with_report(message, dest_hash, planned_hops)
+                            {
+                                let reason = err.error.to_string();
+                                tracing::warn!(
+                                    error = %reason,
+                                    dest = %dest_hex,
+                                    "failed to start direct link delivery"
+                                );
+                                requeue_after_path_request(
+                                    &mut self.router,
+                                    &self.transport_tx,
+                                    err.message,
+                                    dest_hash,
+                                    &reason,
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                    DirectDeliveryPlan::Fail => {
+                        tracing::warn!(
+                            dest = %dest_hex,
+                            attempts = message.delivery_attempts,
+                            "direct delivery failed before link delivery"
                         );
                     }
                 }
@@ -2581,6 +2671,28 @@ mod tests {
     }
 
     #[test]
+    fn queue_path_request_can_drop_stale_path_before_requesting() {
+        let (tx, mut rx) = mpsc::channel::<TransportMessage>(4);
+        let dest = [0x24; 16];
+
+        queue_path_request(&tx, dest, true, "test rediscovery");
+
+        match rx.try_recv().expect("drop path rpc") {
+            TransportMessage::Rpc {
+                query: TransportQuery::DropPath { dest: dropped },
+                ..
+            } => assert_eq!(dropped, dest),
+            other => panic!("expected DropPath RPC, got {other:?}"),
+        }
+        match rx.try_recv().expect("path request") {
+            TransportMessage::RequestPath { destination_hash } => {
+                assert_eq!(destination_hash, dest);
+            }
+            other => panic!("expected RequestPath, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn path_request_requeue_can_preserve_attempt_count_after_link_start_failure() {
         let mut router = LxmRouter::new(Default::default());
         let (tx, _rx) = mpsc::channel::<TransportMessage>(4);
@@ -2636,5 +2748,18 @@ mod tests {
 
         hops.insert(dest, 0);
         assert_eq!(route_hops_for(&hops, dest), 1);
+    }
+
+    #[test]
+    fn direct_route_snapshot_uses_cached_announce_hops() {
+        let dest = [0x88; 16];
+        let mut hops = HashMap::new();
+
+        assert!(direct_route_snapshot(&hops, dest).is_none());
+
+        hops.insert(dest, 5);
+        let snapshot = direct_route_snapshot(&hops, dest).expect("route snapshot");
+        assert_eq!(snapshot.destination_hash, dest);
+        assert_eq!(snapshot.hops, 5);
     }
 }
