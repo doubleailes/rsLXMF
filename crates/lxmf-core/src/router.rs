@@ -719,6 +719,56 @@ impl LxmRouter {
         false
     }
 
+    /// Mark a pending outbound message delivered and remove it from the
+    /// outbound queue.
+    pub fn mark_outbound_delivered(&mut self, message_hash: &[u8; 32]) -> bool {
+        let Some(pos) = self
+            .pending_outbound
+            .iter()
+            .position(|m| m.hash.as_ref() == Some(message_hash))
+        else {
+            return false;
+        };
+
+        let mut msg = self.pending_outbound.remove(pos);
+        msg.mark_delivered();
+        true
+    }
+
+    /// Mark a pending outbound message failed and remove it from the outbound
+    /// queue.
+    pub fn mark_outbound_failed(&mut self, message_hash: &[u8; 32]) -> bool {
+        let Some(pos) = self
+            .pending_outbound
+            .iter()
+            .position(|m| m.hash.as_ref() == Some(message_hash))
+        else {
+            return false;
+        };
+
+        let mut msg = self.pending_outbound.remove(pos);
+        msg.mark_failed();
+        true
+    }
+
+    /// Re-arm a pending outbound message after a path request without adding a
+    /// duplicate queue entry.
+    pub fn defer_outbound_for_path_request(&mut self, message_hash: &[u8; 32], now: f64) -> bool {
+        let Some(msg) = self
+            .pending_outbound
+            .iter_mut()
+            .find(|m| m.hash.as_ref() == Some(message_hash))
+        else {
+            return false;
+        };
+
+        msg.next_delivery_attempt = now + PATH_REQUEST_WAIT as f64;
+        if msg.progress < 0.01 {
+            msg.progress = 0.01;
+        }
+        true
+    }
+
     /// Get the outbound-delivery progress (0.0..=1.0) for a pending message.
     ///
     /// Python reference: `LXMRouter.get_outbound_progress` — LXMRouter.py:489-495.
@@ -1338,6 +1388,156 @@ impl LxmRouter {
         actions
     }
 
+    /// Process outbound messages while keeping Direct deliveries in the router
+    /// queue until LinkDeliveryManager reports a terminal result.
+    ///
+    /// This mirrors Python's `LXMRouter.process_outbound` ownership model for
+    /// Direct messages while preserving [`Self::process_outbound`] for older
+    /// embedders that still take ownership of Direct messages themselves.
+    pub fn process_outbound_with_direct<F>(&mut self, mut direct_input: F) -> Vec<OutboundAction>
+    where
+        F: FnMut(&LxMessage, f64) -> DirectDeliveryPlanInput,
+    {
+        if !self.config.ext.processing_outbound {
+            return Vec::new();
+        }
+
+        let mut actions = Vec::new();
+        let mut processed = 0usize;
+        let mut i = 0;
+
+        while i < self.pending_outbound.len() {
+            if let Some(limit) = self.config.ext.processing_limit
+                && processed >= limit
+            {
+                break;
+            }
+
+            let now = now_f64();
+
+            if self.pending_outbound[i].delivery_attempts > MAX_DELIVERY_ATTEMPTS {
+                let mut msg = self.pending_outbound.remove(i);
+                msg.mark_failed();
+                actions.push(OutboundAction::Failed(msg));
+                processed += 1;
+                continue;
+            }
+
+            let age = now - self.pending_outbound[i].timestamp;
+            if age > MESSAGE_EXPIRY as f64 {
+                let mut msg = self.pending_outbound.remove(i);
+                msg.mark_failed();
+                actions.push(OutboundAction::Expired(msg));
+                processed += 1;
+                continue;
+            }
+
+            match self.pending_outbound[i].method {
+                DeliveryMethod::Direct => {
+                    let input = direct_input(&self.pending_outbound[i], now);
+                    if input.reusable_link == DirectReusableLinkState::None {
+                        let msg = &self.pending_outbound[i];
+                        let due_at = if msg.next_delivery_attempt > 0.0 {
+                            msg.next_delivery_attempt
+                        } else if msg.last_delivery_attempt > 0.0 {
+                            msg.last_delivery_attempt + DELIVERY_RETRY_WAIT as f64
+                        } else {
+                            0.0
+                        };
+                        if now < due_at {
+                            i += 1;
+                            continue;
+                        }
+                    }
+
+                    if self.pending_outbound[i].state != MessageState::Sending {
+                        self.pending_outbound[i].mark_sending();
+                    }
+                    let plan = plan_direct_delivery(&mut self.pending_outbound[i], input, now);
+                    match plan {
+                        DirectDeliveryPlan::Fail => {
+                            let mut msg = self.pending_outbound.remove(i);
+                            msg.mark_failed();
+                            actions.push(OutboundAction::Failed(msg));
+                            processed += 1;
+                            continue;
+                        }
+                        DirectDeliveryPlan::DeferTerminalFailure => {
+                            processed += 1;
+                            i += 1;
+                        }
+                        _ => {
+                            let msg = self.pending_outbound[i].clone();
+                            let dest_hash = msg.destination_hash;
+                            actions.push(OutboundAction::PlanDirect {
+                                message: msg,
+                                dest_hash,
+                                plan,
+                            });
+                            processed += 1;
+                            i += 1;
+                        }
+                    }
+                }
+                DeliveryMethod::Propagated => {
+                    let msg = &self.pending_outbound[i];
+                    let due_at = if msg.next_delivery_attempt > 0.0 {
+                        msg.next_delivery_attempt
+                    } else if msg.last_delivery_attempt > 0.0 {
+                        msg.last_delivery_attempt + DELIVERY_RETRY_WAIT as f64
+                    } else {
+                        0.0
+                    };
+                    if now < due_at {
+                        i += 1;
+                        continue;
+                    }
+
+                    if let Some(peer_hash) = self.outbound_propagation_node {
+                        let mut msg = self.pending_outbound.remove(i);
+                        msg.mark_sending();
+                        actions.push(OutboundAction::DeliverPropagated {
+                            message: msg,
+                            prop_hash: peer_hash,
+                        });
+                        processed += 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+                DeliveryMethod::Opportunistic => {
+                    let msg = &self.pending_outbound[i];
+                    let due_at = if msg.next_delivery_attempt > 0.0 {
+                        msg.next_delivery_attempt
+                    } else if msg.last_delivery_attempt > 0.0 {
+                        msg.last_delivery_attempt + DELIVERY_RETRY_WAIT as f64
+                    } else {
+                        0.0
+                    };
+                    if now < due_at {
+                        i += 1;
+                        continue;
+                    }
+
+                    let mut msg = self.pending_outbound.remove(i);
+                    msg.mark_sent();
+                    msg.progress = 0.50;
+                    let dest_hash = msg.destination_hash;
+                    actions.push(OutboundAction::DeliverOpportunistic {
+                        message: msg,
+                        dest_hash,
+                    });
+                    processed += 1;
+                }
+                DeliveryMethod::Paper => {
+                    i += 1;
+                }
+            }
+        }
+
+        actions
+    }
+
     pub fn cull_stamp_costs(&mut self) {
         let now = now_f64();
         self.outbound_stamp_costs
@@ -1435,7 +1635,7 @@ impl LxmRouter {
                         }
                     }
                 }
-                OutboundAction::DeliverDirect { .. } => {
+                OutboundAction::DeliverDirect { .. } | OutboundAction::PlanDirect { .. } => {
                     tracing::warn!(
                         "Direct LXMF delivery requires LinkDeliveryManager; action left for embedding runtime"
                     );
@@ -1522,6 +1722,13 @@ pub enum OutboundAction {
         message: LxMessage,
         dest_hash: [u8; 16],
     },
+    /// Direct delivery planned without removing the message from
+    /// `pending_outbound`.
+    PlanDirect {
+        message: LxMessage,
+        dest_hash: [u8; 16],
+        plan: DirectDeliveryPlan,
+    },
     DeliverPropagated {
         message: LxMessage,
         prop_hash: [u8; 16],
@@ -1590,13 +1797,15 @@ mod tests {
     use super::*;
 
     fn direct_policy_message() -> LxMessage {
-        LxMessage::new(
+        let mut message = LxMessage::new(
             [0xAA; 16],
             [0xBB; 16],
             "Direct",
             "hello",
             DeliveryMethod::Direct,
-        )
+        );
+        message.compute_hash().unwrap();
+        message
     }
 
     #[test]
@@ -1772,6 +1981,93 @@ mod tests {
 
         assert_eq!(plan, DirectDeliveryPlan::Fail);
         assert_eq!(msg.state, MessageState::Failed);
+    }
+
+    #[test]
+    fn test_process_outbound_with_direct_keeps_message_pending() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let msg = direct_policy_message();
+        let msg_hash = msg.hash;
+        let dest = msg.destination_hash;
+        router.send(msg);
+
+        let actions =
+            router.process_outbound_with_direct(|message, _now| DirectDeliveryPlanInput {
+                identity_known: true,
+                route: Some(DirectRouteSnapshot::new(message.destination_hash, 4)),
+                reusable_link: DirectReusableLinkState::None,
+            });
+
+        assert_eq!(router.pending_outbound.len(), 1);
+        let pending = &router.pending_outbound[0];
+        assert_eq!(pending.hash, msg_hash);
+        assert_eq!(pending.state, MessageState::Sending);
+        assert_eq!(pending.delivery_attempts, 1);
+        assert_eq!(pending.progress, 0.03);
+        match actions.as_slice() {
+            [
+                OutboundAction::PlanDirect {
+                    message,
+                    dest_hash,
+                    plan,
+                },
+            ] => {
+                assert_eq!(*dest_hash, dest);
+                assert_eq!(message.hash, msg_hash);
+                assert_eq!(*plan, DirectDeliveryPlan::StartNewLink { hops: 4 });
+            }
+            other => panic!("expected PlanDirect StartNewLink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_process_outbound_with_direct_polls_pending_link_despite_retry_deadline() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let mut msg = direct_policy_message();
+        msg.next_delivery_attempt = now_f64() + 3600.0;
+        let msg_hash = msg.hash;
+        router.send(msg);
+
+        let actions =
+            router.process_outbound_with_direct(|_message, _now| DirectDeliveryPlanInput {
+                identity_known: true,
+                route: None,
+                reusable_link: DirectReusableLinkState::Pending,
+            });
+
+        assert_eq!(router.pending_outbound.len(), 1);
+        assert_eq!(router.pending_outbound[0].hash, msg_hash);
+        assert_eq!(router.pending_outbound[0].delivery_attempts, 0);
+        match actions.as_slice() {
+            [OutboundAction::PlanDirect { plan, .. }] => {
+                assert_eq!(*plan, DirectDeliveryPlan::WaitForReusableLink);
+            }
+            other => panic!("expected PlanDirect WaitForReusableLink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_outbound_terminal_helpers_update_pending_queue() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let first = direct_policy_message();
+        let first_hash = first.hash.expect("first hash");
+        router.send(first);
+
+        assert!(router.defer_outbound_for_path_request(&first_hash, 1000.0));
+        assert_eq!(
+            router.pending_outbound[0].next_delivery_attempt,
+            1000.0 + PATH_REQUEST_WAIT as f64
+        );
+        assert_eq!(router.pending_outbound[0].progress, 0.01);
+
+        assert!(router.mark_outbound_delivered(&first_hash));
+        assert!(router.pending_outbound.is_empty());
+
+        let second = direct_policy_message();
+        let second_hash = second.hash.expect("second hash");
+        router.send(second);
+        assert!(router.mark_outbound_failed(&second_hash));
+        assert!(router.pending_outbound.is_empty());
     }
 
     #[test]

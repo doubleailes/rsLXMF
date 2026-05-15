@@ -1661,7 +1661,10 @@ impl LxmdRunner {
     fn execute_encrypted_actions(&mut self, actions: Vec<OutboundAction>) {
         for action in actions {
             let (mut message, dest_hash, is_opportunistic) = match action {
-                OutboundAction::DeliverDirect { message, dest_hash } => (message, dest_hash, false),
+                OutboundAction::DeliverDirect { message, dest_hash }
+                | OutboundAction::PlanDirect {
+                    message, dest_hash, ..
+                } => (message, dest_hash, false),
                 OutboundAction::DeliverOpportunistic { message, dest_hash } => {
                     (message, dest_hash, true)
                 }
