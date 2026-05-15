@@ -85,6 +85,12 @@ pub struct LxMessage {
     pub delivery_attempts: u32,
     /// Unix timestamp of the last delivery attempt; 0.0 means never attempted.
     pub last_delivery_attempt: f64,
+    /// Absolute Unix timestamp before which the message must not be re-attempted.
+    /// Mirrors Python LXMF `LXMessage.next_delivery_attempt`: set to
+    /// `now + PATH_REQUEST_WAIT` after a path request, `now + DELIVERY_RETRY_WAIT`
+    /// after a link attempt. 0.0 = no explicit deadline (router falls back to
+    /// `last_delivery_attempt + DELIVERY_RETRY_WAIT`).
+    pub next_delivery_attempt: f64,
     /// SHA-256 of the packed message.
     pub hash: Option<[u8; 32]>,
     /// Alias for [`hash`](Self::hash) set after packing.
@@ -150,6 +156,7 @@ impl LxMessage {
             ratchet_id: None,
             delivery_attempts: 0,
             last_delivery_attempt: 0.0,
+            next_delivery_attempt: 0.0,
             hash: None,
             message_id: None,
             transient_id: None,
@@ -460,6 +467,7 @@ impl LxMessage {
             ratchet_id: None,
             delivery_attempts: 0,
             last_delivery_attempt: 0.0,
+            next_delivery_attempt: 0.0,
             hash: Some(hash),
             message_id: Some(hash),
             transient_id: None,

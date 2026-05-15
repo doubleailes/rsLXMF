@@ -160,7 +160,6 @@ pub struct LxmRouter {
     pub propagation_start_time: Option<f64>,
     pub processing_count: u64,
     pub outbound_propagation_node: Option<[u8; 16]>,
-    pub propagation_transfer_state: PropagationRetrievalState,
     /// Progress in the range 0.0..=1.0.
     pub propagation_transfer_progress: f64,
     pub client_propagation_messages_received: u64,
@@ -214,7 +213,6 @@ impl LxmRouter {
             propagation_start_time: None,
             processing_count: 0,
             outbound_propagation_node: None,
-            propagation_transfer_state: PropagationRetrievalState::Idle,
             propagation_transfer_progress: 0.0,
             client_propagation_messages_received: 0,
             client_propagation_messages_served: 0,
@@ -1124,7 +1122,9 @@ impl LxmRouter {
 
             let now = now_f64();
 
-            if msg.delivery_attempts >= MAX_DELIVERY_ATTEMPTS {
+            // Python fails only when delivery_attempts > MAX (outer guard is
+            // `<= MAX`, LXMRouter.py:2597/2671); match that boundary exactly.
+            if msg.delivery_attempts > MAX_DELIVERY_ATTEMPTS {
                 let mut msg = self.pending_outbound.remove(i);
                 msg.mark_failed();
                 actions.push(OutboundAction::Failed(msg));
@@ -1132,12 +1132,20 @@ impl LxmRouter {
                 continue;
             }
 
-            if msg.last_delivery_attempt > 0.0 {
-                let since_last = now - msg.last_delivery_attempt;
-                if since_last < DELIVERY_RETRY_WAIT as f64 {
-                    i += 1;
-                    continue;
-                }
+            // Python LXMF gates on an absolute `next_delivery_attempt`. Honor an
+            // explicit deadline when set (path request -> now+7s, etc.);
+            // otherwise fall back to the legacy
+            // last_delivery_attempt + DELIVERY_RETRY_WAIT (10s) rule.
+            let due_at = if msg.next_delivery_attempt > 0.0 {
+                msg.next_delivery_attempt
+            } else if msg.last_delivery_attempt > 0.0 {
+                msg.last_delivery_attempt + DELIVERY_RETRY_WAIT as f64
+            } else {
+                0.0
+            };
+            if now < due_at {
+                i += 1;
+                continue;
             }
 
             let age = now - msg.timestamp;
@@ -1786,8 +1794,30 @@ mod tests {
         assert!(router.pending_outbound.is_empty());
     }
 
+    /// Python fails a message only when delivery_attempts > MAX_DELIVERY_ATTEMPTS
+    /// (outer guard is `<= MAX`, LXMRouter.py:2597/2671). Pin that boundary.
     #[test]
-    fn test_process_outbound_max_attempts() {
+    fn test_process_outbound_fails_only_above_max_attempts() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Test",
+            "Content",
+            DeliveryMethod::Direct,
+        );
+        msg.delivery_attempts = MAX_DELIVERY_ATTEMPTS + 1;
+        router.send(msg);
+
+        let actions = router.process_outbound();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], OutboundAction::Failed(_)));
+        assert!(router.pending_outbound.is_empty());
+    }
+
+    /// At exactly MAX the message is still attempted (dispatched), not failed.
+    #[test]
+    fn test_process_outbound_at_max_attempts_not_failed() {
         let mut router = LxmRouter::new(RouterConfig::default());
         let mut msg = LxMessage::new(
             [0xAA; 16],
@@ -1801,7 +1831,10 @@ mod tests {
 
         let actions = router.process_outbound();
         assert_eq!(actions.len(), 1);
-        assert!(router.pending_outbound.is_empty());
+        assert!(
+            !matches!(actions[0], OutboundAction::Failed(_)),
+            "at exactly MAX the message is still attempted, not failed"
+        );
     }
 
     #[test]

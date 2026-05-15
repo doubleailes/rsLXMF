@@ -148,8 +148,6 @@ pub const PEERING_COST: u8 = 18;
 pub const MAX_PEERING_COST: u8 = 26;
 pub const MAX_PEERS: usize = 20;
 pub const PN_STAMP_THROTTLE: u64 = 180;
-/// Propagation retrieval path timeout (seconds).
-pub const PR_PATH_TIMEOUT: u64 = 10;
 
 pub const AUTOPEER: bool = true;
 pub const AUTOPEER_MAXDEPTH: usize = 4;
@@ -167,26 +165,6 @@ pub const UNPEER_REQUEST_PATH: &str = "/pn/peer/unpeer";
 pub const PR_ALL_MESSAGES: u32 = 0x00;
 /// Signal value for duplicate detection during sync.
 pub const DUPLICATE_SIGNAL: &str = "lxmf_duplicate";
-
-/// Client-side state machine for retrieving messages from a propagation node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(u8)]
-pub enum PropagationRetrievalState {
-    Idle = 0x00,
-    PathRequested = 0x01,
-    LinkEstablishing = 0x02,
-    LinkEstablished = 0x03,
-    RequestSent = 0x04,
-    Receiving = 0x05,
-    ResponseReceived = 0x06,
-    Complete = 0x07,
-    NoPath = 0xF0,
-    LinkFailed = 0xF1,
-    TransferFailed = 0xF2,
-    NoIdentityReceived = 0xF3,
-    NoAccess = 0xF4,
-    Failed = 0xFE,
-}
 
 pub const OFFER_REQUEST_PATH: &str = "/offer";
 pub const MESSAGE_GET_PATH: &str = "/get";
@@ -335,17 +313,6 @@ mod tests {
         assert_eq!(DeliveryRepresentation::Packet as u8, 0x01);
         assert_eq!(DeliveryRepresentation::Resource as u8, 0x02);
         assert_eq!(DeliveryRepresentation::Paper as u8, 0x05);
-    }
-
-    #[test]
-    fn test_propagation_retrieval_states() {
-        assert_eq!(PropagationRetrievalState::Idle as u8, 0x00);
-        assert_eq!(PropagationRetrievalState::Complete as u8, 0x07);
-        assert_eq!(PropagationRetrievalState::NoPath as u8, 0xF0);
-        assert_eq!(PropagationRetrievalState::Failed as u8, 0xFE);
-        // Ordering must support range comparisons.
-        assert!(PropagationRetrievalState::Idle < PropagationRetrievalState::LinkEstablished);
-        assert!(PropagationRetrievalState::Complete < PropagationRetrievalState::NoPath);
     }
 
     #[test]
