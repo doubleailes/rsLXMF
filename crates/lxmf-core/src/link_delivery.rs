@@ -1056,7 +1056,12 @@ impl LinkDeliveryManager {
                         rns_wire::context::PacketContext::None
                             if header.flags.packet_type == rns_wire::flags::PacketType::Data =>
                         {
-                            self.handle_inbound_link_packet(&link_id, &raw, data);
+                            self.handle_inbound_link_packet(
+                                &link_id,
+                                &raw,
+                                header.flags.header_type,
+                                data,
+                            );
                         }
                         rns_wire::context::PacketContext::ResourceHmu => {
                             let plaintext = self
@@ -1173,6 +1178,7 @@ impl LinkDeliveryManager {
         &mut self,
         link_id: &[u8; 16],
         raw: &[u8],
+        header_type: rns_wire::flags::HeaderType,
         encrypted_data: &[u8],
     ) -> bool {
         let Some(delivery) = self.pending.get_mut(link_id) else {
@@ -1192,7 +1198,7 @@ impl LinkDeliveryManager {
             let _ = tx.try_send((plaintext, *link_id));
         }
 
-        let packet_hash = rns_wire::hash::packet_hash(raw, rns_wire::flags::HeaderType::Header1);
+        let packet_hash = rns_wire::hash::packet_hash(raw, header_type);
         if let Ok(proof_data) = delivery.link.prove_packet_with_link_key(&packet_hash) {
             let proof_header = rns_wire::header::PacketHeader {
                 flags: rns_wire::flags::PacketFlags {
@@ -2833,16 +2839,31 @@ mod tests {
         context: rns_wire::context::PacketContext,
         payload: &[u8],
     ) -> Bytes {
+        link_data_packet_with_header(
+            link_id,
+            rns_wire::flags::HeaderType::Header1,
+            context,
+            payload,
+        )
+    }
+
+    fn link_data_packet_with_header(
+        link_id: [u8; 16],
+        header_type: rns_wire::flags::HeaderType,
+        context: rns_wire::context::PacketContext,
+        payload: &[u8],
+    ) -> Bytes {
         let header = rns_wire::header::PacketHeader {
             flags: rns_wire::flags::PacketFlags {
-                header_type: rns_wire::flags::HeaderType::Header1,
+                header_type,
                 context_flag: false,
                 transport_type: rns_wire::flags::TransportType::Broadcast,
                 destination_type: rns_wire::flags::DestinationType::Link,
                 packet_type: rns_wire::flags::PacketType::Data,
             },
             hops: 0,
-            transport_id: None,
+            transport_id: (header_type == rns_wire::flags::HeaderType::Header2)
+                .then_some([0xEE; 16]),
             destination_hash: link_id,
             context,
         };
@@ -3544,6 +3565,71 @@ mod tests {
         assert!(
             responder_link.validate_packet_proof(&packet_hash, &proof_raw[proof_offset..]),
             "initiator-side proof must be signed with the link key"
+        );
+    }
+
+    #[test]
+    fn test_outbound_direct_backchannel_proof_uses_received_header_type() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_inbound_packet_sender(inbound_tx);
+
+        let responder_key = Ed25519PrivateKey::generate();
+        let sign_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xD7; 16];
+
+        let mut msg = LxMessage::new(
+            [0xAC; 16],
+            [0xBC; 16],
+            "Initial",
+            "header2 direct reply",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let (link_id, responder_link) =
+            establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+
+        assert!(mgr.tick().is_empty());
+        complete_next_link_packet(&mut mgr, &mut rx, link_id, &responder_link, &responder_key);
+        assert!(
+            mgr.tick()
+                .iter()
+                .any(|r| matches!(r, DeliveryResult::Complete { .. }))
+        );
+
+        let payload = b"reply carried in transported header2 packet";
+        let encrypted = responder_link.encrypt(payload).unwrap();
+        let raw = link_data_packet_with_header(
+            link_id,
+            rns_wire::flags::HeaderType::Header2,
+            rns_wire::context::PacketContext::None,
+            &encrypted,
+        );
+        let packet_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header2);
+        mgr.event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                raw: raw.clone(),
+                interface_id: 0,
+            })
+            .unwrap();
+
+        mgr.drain_events(&HashMap::new());
+
+        let (delivered, delivered_link_id) = inbound_rx.try_recv().unwrap();
+        assert_eq!(delivered, payload);
+        assert_eq!(delivered_link_id, link_id);
+
+        let proof_raw = next_outbound(&mut rx);
+        let (proof_header, proof_offset) =
+            rns_wire::header::PacketHeader::unpack(&proof_raw).unwrap();
+        assert_eq!(
+            proof_header.context,
+            rns_wire::context::PacketContext::LinkProof
+        );
+        assert!(
+            responder_link.validate_packet_proof(&packet_hash, &proof_raw[proof_offset..]),
+            "link proof must hash the received Header2 packet shape"
         );
     }
 
