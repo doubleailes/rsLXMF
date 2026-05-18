@@ -432,6 +432,7 @@ pub struct LinkDeliveryManager {
     backchannel_links: HashMap<[u8; 16], [u8; 16]>,
     pending: HashMap<[u8; 16], PendingDelivery>,
     backchannel_tx: Option<mpsc::Sender<BackchannelSendCommand>>,
+    inbound_packet_tx: Option<mpsc::Sender<(Vec<u8>, [u8; 16])>>,
     pending_backchannel_starts: Vec<PendingBackchannelStart>,
     pending_backchannel_deliveries: HashMap<BackchannelProofKey, PendingBackchannelDelivery>,
     identity_pub: Option<[u8; 64]>,
@@ -454,6 +455,7 @@ impl LinkDeliveryManager {
             backchannel_links: HashMap::new(),
             pending: HashMap::new(),
             backchannel_tx: None,
+            inbound_packet_tx: None,
             pending_backchannel_starts: Vec::new(),
             pending_backchannel_deliveries: HashMap::new(),
             identity_pub,
@@ -468,6 +470,15 @@ impl LinkDeliveryManager {
     /// authenticated backchannel Links owned by the embedding runtime.
     pub fn set_backchannel_sender(&mut self, tx: mpsc::Sender<BackchannelSendCommand>) {
         self.backchannel_tx = Some(tx);
+    }
+
+    /// Install the adapter used to deliver inbound LXMF payloads that arrive
+    /// over outbound reusable Direct links. This is required for peer
+    /// backchannels: the outbound Direct manager owns the link_id destination,
+    /// so ordinary link DATA replies route back here rather than to the
+    /// responder-side LinkManager.
+    pub fn set_inbound_packet_sender(&mut self, tx: mpsc::Sender<(Vec<u8>, [u8; 16])>) {
+        self.inbound_packet_tx = Some(tx);
     }
 
     /// Register an inbound authenticated Link as a reusable backchannel for a
@@ -1042,6 +1053,11 @@ impl LinkDeliveryManager {
                         {
                             self.handle_link_packet_proof(&link_id, data);
                         }
+                        rns_wire::context::PacketContext::None
+                            if header.flags.packet_type == rns_wire::flags::PacketType::Data =>
+                        {
+                            self.handle_inbound_link_packet(&link_id, &raw, data);
+                        }
                         rns_wire::context::PacketContext::ResourceHmu => {
                             let plaintext = self
                                 .pending
@@ -1151,6 +1167,57 @@ impl LinkDeliveryManager {
                 false
             }
         }
+    }
+
+    fn handle_inbound_link_packet(
+        &mut self,
+        link_id: &[u8; 16],
+        raw: &[u8],
+        encrypted_data: &[u8],
+    ) -> bool {
+        let Some(delivery) = self.pending.get_mut(link_id) else {
+            return false;
+        };
+        if !delivery.reusable || !delivery.link.is_active() {
+            return false;
+        }
+
+        delivery.link.record_inbound();
+        delivery.link.record_rx(encrypted_data.len());
+        let Ok(plaintext) = delivery.link.decrypt(encrypted_data) else {
+            return false;
+        };
+
+        if let Some(ref tx) = self.inbound_packet_tx {
+            let _ = tx.try_send((plaintext, *link_id));
+        }
+
+        let packet_hash = rns_wire::hash::packet_hash(raw, rns_wire::flags::HeaderType::Header1);
+        if let Ok(proof_data) = delivery.link.prove_packet_with_link_key(&packet_hash) {
+            let proof_header = rns_wire::header::PacketHeader {
+                flags: rns_wire::flags::PacketFlags {
+                    header_type: rns_wire::flags::HeaderType::Header1,
+                    context_flag: false,
+                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                    destination_type: rns_wire::flags::DestinationType::Link,
+                    packet_type: rns_wire::flags::PacketType::Proof,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: *link_id,
+                context: rns_wire::context::PacketContext::LinkProof,
+            };
+            let mut proof_raw = proof_header.pack();
+            proof_raw.extend_from_slice(&proof_data);
+            let _ = self
+                .transport_tx
+                .try_send(TransportMessage::Outbound(OutboundRequest {
+                    raw: Bytes::from(proof_raw),
+                    destination_hash: *link_id,
+                }));
+        }
+
+        true
     }
 
     /// Drive pending deliveries forward; call periodically after [`Self::drain_events`].
@@ -3412,6 +3479,72 @@ mod tests {
         assert_eq!(identified_pub, local_pub);
         assert_eq!(mgr.pending_count(), 0);
         assert_eq!(mgr.session_count(), 1);
+    }
+
+    #[test]
+    fn test_outbound_direct_link_accepts_backchannel_packet() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_inbound_packet_sender(inbound_tx);
+
+        let responder_key = Ed25519PrivateKey::generate();
+        let sign_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xC7; 16];
+
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Initial",
+            "initial direct message",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let (link_id, responder_link) =
+            establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+
+        assert!(mgr.tick().is_empty());
+        complete_next_link_packet(&mut mgr, &mut rx, link_id, &responder_link, &responder_key);
+        let results = mgr.tick();
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, DeliveryResult::Complete { .. }))
+        );
+
+        let payload = b"reply over first direct link";
+        let encrypted = responder_link.encrypt(payload).unwrap();
+        let raw = link_data_packet(link_id, rns_wire::context::PacketContext::None, &encrypted);
+        let packet_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+        mgr.event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                raw: raw.clone(),
+                interface_id: 0,
+            })
+            .unwrap();
+
+        mgr.drain_events(&HashMap::new());
+
+        let (delivered, delivered_link_id) = inbound_rx.try_recv().unwrap();
+        assert_eq!(delivered, payload);
+        assert_eq!(delivered_link_id, link_id);
+
+        let proof_raw = next_outbound(&mut rx);
+        let (proof_header, proof_offset) =
+            rns_wire::header::PacketHeader::unpack(&proof_raw).unwrap();
+        assert_eq!(
+            proof_header.flags.packet_type,
+            rns_wire::flags::PacketType::Proof
+        );
+        assert_eq!(proof_header.destination_hash, link_id);
+        assert_eq!(
+            proof_header.context,
+            rns_wire::context::PacketContext::LinkProof
+        );
+        assert!(
+            responder_link.validate_packet_proof(&packet_hash, &proof_raw[proof_offset..]),
+            "initiator-side proof must be signed with the link key"
+        );
     }
 
     #[test]
