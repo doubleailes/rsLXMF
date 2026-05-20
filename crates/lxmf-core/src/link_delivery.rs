@@ -377,6 +377,21 @@ pub struct DirectLinkSnapshot {
     pub dest_hash: [u8; 16],
     pub link_state: LinkState,
     pub delivery_state: DeliveryState,
+    pub idle_expired: bool,
+    pub queued_deliveries: usize,
+    pub in_flight_deliveries: usize,
+}
+
+/// Snapshot of a message currently owned by link delivery.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MessageDeliverySnapshot {
+    pub link_id: [u8; 16],
+    pub dest_hash: [u8; 16],
+    pub link_state: LinkState,
+    pub delivery_state: DeliveryState,
+    pub representation: DeliveryRepresentation,
+    pub progress: f64,
+    pub queued: bool,
     pub queued_deliveries: usize,
     pub in_flight_deliveries: usize,
 }
@@ -721,7 +736,24 @@ impl LinkDeliveryManager {
         hops: u8,
     ) -> Result<DirectLinkStartReport, LinkDeliveryStartFailure> {
         if let Some(link_id) = self.direct_links.get(&dest_hash).copied() {
-            if let Some(delivery) = self.pending.get_mut(&link_id)
+            let idle_expired = self
+                .pending
+                .get(&link_id)
+                .is_some_and(|delivery| delivery.reusable && direct_link_idle_expired(delivery));
+            if idle_expired {
+                tracing::debug!(
+                    link_id = %hex_encode(&link_id),
+                    dest = %hex_encode(&dest_hash),
+                    "discarding inactive cached Direct link before reuse"
+                );
+                if let Some(mut delivery) = self.pending.remove(&link_id) {
+                    send_link_teardown(&self.transport_tx, &link_id, &mut delivery.link);
+                    let _ = self
+                        .transport_tx
+                        .try_send(TransportMessage::DeregisterDestination { hash: link_id });
+                }
+                self.direct_links.remove(&dest_hash);
+            } else if let Some(delivery) = self.pending.get_mut(&link_id)
                 && delivery.reusable
             {
                 let msg_hash = message.hash;
@@ -782,9 +814,9 @@ impl LinkDeliveryManager {
                     reason: None,
                 });
                 return Ok(report);
+            } else {
+                self.direct_links.remove(&dest_hash);
             }
-
-            self.direct_links.remove(&dest_hash);
         }
 
         let msg_hash = message.hash;
@@ -1573,7 +1605,7 @@ impl LinkDeliveryManager {
                 } else if delivery.state == DeliveryState::Idle
                     && delivery.queued.is_empty()
                     && delivery.link.is_active()
-                    && link_data_idle_for(&delivery.link) > LINK_MAX_INACTIVITY
+                    && direct_link_idle_expired(delivery)
                 {
                     tracing::debug!(
                         link_id = %hex_encode(link_id),
@@ -2102,15 +2134,155 @@ impl LinkDeliveryManager {
         results
     }
 
+    pub fn cancel_delivery_by_message_hash(&mut self, msg_hash: [u8; 32]) -> bool {
+        let mut remove_direct_session = None;
+        let mut cancelled = false;
+
+        for (link_id, delivery) in &mut self.pending {
+            if delivery.msg_hash == Some(msg_hash) {
+                cancel_current_delivery(&self.transport_tx, link_id, delivery);
+                if delivery.reusable && delivery.link.is_active() {
+                    finish_unsuccessful_reusable_delivery(delivery);
+                } else {
+                    remove_direct_session = Some((*link_id, delivery.dest_hash));
+                }
+                cancelled = true;
+                break;
+            }
+
+            if let Some(pos) = delivery
+                .queued
+                .iter()
+                .position(|queued| queued.msg_hash == Some(msg_hash))
+            {
+                delivery.queued.remove(pos);
+                cancelled = true;
+                break;
+            }
+        }
+
+        if let Some((link_id, dest_hash)) = remove_direct_session {
+            if let Some(mut delivery) = self.pending.remove(&link_id) {
+                send_link_teardown(&self.transport_tx, &link_id, &mut delivery.link);
+            }
+            if self.direct_links.get(&dest_hash) == Some(&link_id) {
+                self.direct_links.remove(&dest_hash);
+            }
+        }
+
+        if cancelled {
+            return true;
+        }
+
+        if let Some(pos) = self
+            .pending_backchannel_starts
+            .iter()
+            .position(|start| start.message.hash == Some(msg_hash))
+        {
+            self.pending_backchannel_starts.remove(pos);
+            return true;
+        }
+
+        let pending_key = self
+            .pending_backchannel_deliveries
+            .iter()
+            .find_map(|(key, delivery)| (delivery.message.hash == Some(msg_hash)).then_some(*key));
+        if let Some(key) = pending_key {
+            self.pending_backchannel_deliveries.remove(&key);
+            return true;
+        }
+
+        false
+    }
+
     pub fn take_delivery_events(&mut self) -> Vec<LxmfDeliveryEvent> {
         self.delivery_events.drain(..).collect()
+    }
+
+    pub fn message_delivery_snapshot(&self, msg_hash: [u8; 32]) -> Option<MessageDeliverySnapshot> {
+        for (link_id, delivery) in &self.pending {
+            let in_flight_deliveries = delivery.active_delivery_count();
+            if delivery.state != DeliveryState::Idle && delivery.msg_hash == Some(msg_hash) {
+                return Some(MessageDeliverySnapshot {
+                    link_id: *link_id,
+                    dest_hash: delivery.dest_hash,
+                    link_state: delivery.link.state,
+                    delivery_state: delivery.state,
+                    representation: delivery.message.representation,
+                    progress: delivery.message.progress,
+                    queued: false,
+                    queued_deliveries: delivery.queued.len(),
+                    in_flight_deliveries,
+                });
+            }
+
+            if let Some(queued) = delivery
+                .queued
+                .iter()
+                .find(|queued| queued.msg_hash == Some(msg_hash))
+            {
+                return Some(MessageDeliverySnapshot {
+                    link_id: *link_id,
+                    dest_hash: delivery.dest_hash,
+                    link_state: delivery.link.state,
+                    delivery_state: delivery.state,
+                    representation: queued.message.representation,
+                    progress: queued.message.progress,
+                    queued: true,
+                    queued_deliveries: delivery.queued.len(),
+                    in_flight_deliveries,
+                });
+            }
+        }
+
+        for start in &self.pending_backchannel_starts {
+            if start.message.hash == Some(msg_hash) {
+                return Some(MessageDeliverySnapshot {
+                    link_id: start.link_id,
+                    dest_hash: start.dest_hash,
+                    link_state: LinkState::Active,
+                    delivery_state: DeliveryState::Transferring,
+                    representation: DeliveryRepresentation::Unknown,
+                    progress: start.message.progress,
+                    queued: true,
+                    queued_deliveries: 1,
+                    in_flight_deliveries: 0,
+                });
+            }
+        }
+
+        for (key, delivery) in &self.pending_backchannel_deliveries {
+            if delivery.message.hash == Some(msg_hash) {
+                let link_id = match key {
+                    BackchannelProofKey::Packet(link_id, _)
+                    | BackchannelProofKey::Resource(link_id, _) => *link_id,
+                };
+                return Some(MessageDeliverySnapshot {
+                    link_id,
+                    dest_hash: delivery.dest_hash,
+                    link_state: LinkState::Active,
+                    delivery_state: DeliveryState::AwaitingProof,
+                    representation: delivery.representation,
+                    progress: delivery.message.progress,
+                    queued: false,
+                    queued_deliveries: 0,
+                    in_flight_deliveries: 1,
+                });
+            }
+        }
+
+        None
     }
 
     pub fn delivery_link_available(&self, dest_hash: &[u8; 16]) -> bool {
         self.direct_links
             .get(dest_hash)
             .and_then(|link_id| self.pending.get(link_id))
-            .is_some_and(|delivery| delivery.reusable && delivery.link.state != LinkState::Closed)
+            .is_some_and(|delivery| {
+                delivery.reusable
+                    && delivery.link.state != LinkState::Closed
+                    && !direct_link_idle_expired(delivery)
+            })
             || self.backchannel_links.contains_key(dest_hash)
     }
 
@@ -2122,6 +2294,7 @@ impl LinkDeliveryManager {
             dest_hash,
             link_state: delivery.link.state,
             delivery_state: delivery.state,
+            idle_expired: direct_link_idle_expired(delivery),
             queued_deliveries: delivery.queued.len(),
             in_flight_deliveries: usize::from(delivery.state != DeliveryState::Idle),
         })
@@ -2352,6 +2525,25 @@ fn finish_unsuccessful_reusable_delivery(delivery: &mut PendingDelivery) {
     delivery.state = DeliveryState::Idle;
 }
 
+fn cancel_current_delivery(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    link_id: &[u8; 16],
+    delivery: &mut PendingDelivery,
+) {
+    if let Some(resource_hash) = delivery
+        .transfer
+        .as_ref()
+        .map(|transfer| transfer.resource.resource_hash)
+    {
+        let _ = dispatch_action(
+            link_id,
+            delivery,
+            transport_tx,
+            TransferAction::SendCancel(rns_protocol::resource::CancelType::Icl, resource_hash),
+        );
+    }
+}
+
 fn push_failed_delivery_and_queue(
     results: &mut Vec<DeliveryResult>,
     events: &mut VecDeque<LxmfDeliveryEvent>,
@@ -2513,6 +2705,13 @@ fn send_link_close_payload(
 
 fn link_data_idle_for(link: &Link) -> Duration {
     link.no_data_for().min(link.no_outbound_for())
+}
+
+fn direct_link_idle_expired(delivery: &PendingDelivery) -> bool {
+    delivery.state == DeliveryState::Idle
+        && delivery.queued.is_empty()
+        && delivery.link.is_active()
+        && link_data_idle_for(&delivery.link) > LINK_MAX_INACTIVITY
 }
 
 fn build_resource_transfer(
@@ -3788,6 +3987,93 @@ mod tests {
             delivery.remaining_segments.len(),
             transfer.resource.total_segments - 1
         );
+    }
+
+    #[test]
+    fn test_message_delivery_snapshot_reports_active_resource() {
+        let (tx, mut rx) = mpsc::channel(512);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Snapshot Direct",
+            &"x".repeat(MAX_EFFICIENT_SIZE + 256),
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash.unwrap();
+
+        let responder_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xCC; 16];
+        let (link_id, _responder_link) =
+            establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+        let _ = mgr.take_delivery_events();
+        assert!(mgr.tick().is_empty());
+
+        let snapshot = mgr
+            .message_delivery_snapshot(msg_hash)
+            .expect("snapshot for active direct resource");
+        assert_eq!(snapshot.link_id, link_id);
+        assert_eq!(snapshot.dest_hash, dest_hash);
+        assert_eq!(snapshot.delivery_state, DeliveryState::Transferring);
+        assert_eq!(snapshot.representation, DeliveryRepresentation::Resource);
+        assert_eq!(snapshot.progress, 0.10);
+        assert!(!snapshot.queued);
+        assert_eq!(snapshot.in_flight_deliveries, 1);
+    }
+
+    #[test]
+    fn test_cancel_delivery_by_message_hash_sends_resource_icl_and_reuses_link() {
+        let (tx, mut rx) = mpsc::channel(512);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Cancel Direct",
+            &"x".repeat(MAX_EFFICIENT_SIZE + 256),
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash.unwrap();
+
+        let responder_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xC8; 16];
+        let (link_id, _responder_link) =
+            establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+        let _ = mgr.take_delivery_events();
+        assert!(mgr.tick().is_empty());
+        let _ = mgr.take_delivery_events();
+
+        assert!(mgr.cancel_delivery_by_message_hash(msg_hash));
+        assert_eq!(mgr.pending_count(), 0);
+        assert_eq!(mgr.session_count(), 1);
+        assert!(mgr.delivery_link_available(&dest_hash));
+        assert_eq!(
+            mgr.pending.get(&link_id).unwrap().state,
+            DeliveryState::Idle
+        );
+        assert!(
+            mgr.take_delivery_events()
+                .iter()
+                .all(|event| event.kind != LxmfDeliveryEventKind::Failed)
+        );
+
+        let mut saw_icl = false;
+        while let Ok(message) = rx.try_recv() {
+            let TransportMessage::Outbound(request) = message else {
+                continue;
+            };
+            let (header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+            if header.context == rns_wire::context::PacketContext::ResourceIcl {
+                assert_eq!(header.destination_hash, link_id);
+                saw_icl = true;
+            }
+        }
+        assert!(saw_icl, "resource cancellation must emit RESOURCE_ICL");
     }
 
     #[test]
