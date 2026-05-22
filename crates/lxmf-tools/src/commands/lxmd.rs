@@ -136,6 +136,26 @@ fn queue_path_request(
     }
 }
 
+fn queue_unknown_propagation_node_path_request(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    node: [u8; 16],
+    last_propagation_check: &mut f64,
+    now: f64,
+) -> bool {
+    *last_propagation_check = now;
+    if let Err(e) = transport_tx.try_send(TransportMessage::RequestPath {
+        destination_hash: node,
+    }) {
+        tracing::warn!(
+            node = %hex::encode(node),
+            error = %e,
+            "failed to queue propagation node path request before download"
+        );
+        return false;
+    }
+    true
+}
+
 fn requeue_after_path_request(
     router: &mut LxmRouter,
     transport_tx: &mpsc::Sender<TransportMessage>,
@@ -1428,13 +1448,17 @@ impl LxmdRunner {
                     self.last_propagation_check = now;
                     tracing::debug!("auto-triggered propagation download");
                 } else if let Some(node) = self.router.outbound_propagation_node {
-                    let _ = self.transport_tx.try_send(TransportMessage::RequestPath {
-                        destination_hash: node,
-                    });
-                    tracing::debug!(
-                        node = %hex::encode(node),
-                        "propagation node identity unknown; requesting path before download"
-                    );
+                    if queue_unknown_propagation_node_path_request(
+                        &self.transport_tx,
+                        node,
+                        &mut self.last_propagation_check,
+                        now,
+                    ) {
+                        tracing::debug!(
+                            node = %hex::encode(node),
+                            "propagation node identity unknown; requesting path before download"
+                        );
+                    }
                 }
             }
         }
@@ -3045,6 +3069,42 @@ mod tests {
             }
             other => panic!("expected RequestPath, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unknown_propagation_node_path_request_updates_backoff_clock() {
+        let (tx, mut rx) = mpsc::channel::<TransportMessage>(4);
+        let node = [0x26; 16];
+        let mut last = 0.0;
+        let now = 1234.5;
+
+        assert!(queue_unknown_propagation_node_path_request(
+            &tx, node, &mut last, now
+        ));
+        assert_eq!(last, now);
+        match rx.try_recv().expect("path request") {
+            TransportMessage::RequestPath { destination_hash } => {
+                assert_eq!(destination_hash, node);
+            }
+            other => panic!("expected RequestPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_propagation_node_path_request_updates_backoff_clock_on_full_channel() {
+        let (tx, _rx) = mpsc::channel::<TransportMessage>(1);
+        let node = [0x27; 16];
+        let mut last = 99.0;
+
+        tx.try_send(TransportMessage::RequestPath {
+            destination_hash: [0x28; 16],
+        })
+        .expect("fill test channel");
+
+        assert!(!queue_unknown_propagation_node_path_request(
+            &tx, node, &mut last, 1234.5
+        ));
+        assert_eq!(last, 1234.5);
     }
 
     #[test]
