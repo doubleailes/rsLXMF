@@ -564,8 +564,7 @@ impl LxmdRunner {
             delivery_rx,
             &identity,
             LXMF_APP_NAME,
-            signing_key
-                .unwrap_or_else(|| panic!("Identity must have signing key for link management")),
+            signing_key,
         );
         link_mgr.set_link_packet_channel(link_packet_tx);
         link_mgr.set_resource_completed_channel(resource_tx);
@@ -645,7 +644,7 @@ impl LxmdRunner {
                 prop_delivery_rx,
                 &identity,
                 "lxmf.propagation",
-                prop_signing_key,
+                Some(prop_signing_key),
             );
             prop_link_mgr.set_link_packet_channel(prop_link_packet_tx);
             prop_link_mgr.set_resource_completed_channel(prop_resource_tx);
@@ -730,7 +729,7 @@ impl LxmdRunner {
                 control_delivery_rx,
                 &identity,
                 CONTROL_APP_NAME,
-                control_signing_key,
+                Some(control_signing_key),
             );
             let control_link_identities = control_link_mgr.link_identities_handle();
             let stats_path_hash =
