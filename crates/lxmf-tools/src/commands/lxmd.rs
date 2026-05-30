@@ -636,6 +636,8 @@ impl LxmdRunner {
                 }
             };
 
+            // TODO(hardware-identity): route propagation link signing through the
+            // backend-aware Identity path before supporting hardware-backed lxmd.
             let prop_signing_key = identity.get_signing_key().unwrap_or_else(|| {
                 panic!("Identity must have signing key for propagation link management")
             });
@@ -721,6 +723,8 @@ impl LxmdRunner {
                 delivery_tx: Some(control_delivery_tx),
             });
 
+            // TODO(hardware-identity): route control link signing through the
+            // backend-aware Identity path before supporting hardware-backed lxmd.
             let control_signing_key = identity.get_signing_key().unwrap_or_else(|| {
                 panic!("Identity must have signing key for control link management")
             });
