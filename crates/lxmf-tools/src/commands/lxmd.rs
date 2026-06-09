@@ -372,6 +372,46 @@ fn create_propagation_announce_packet_for(
     Ok(raw)
 }
 
+/// Soft cap on announce-learned identity keys. Python bounds its equivalent
+/// store via Transport's known-destinations cleanup; lxmd has no last-use
+/// signal, so over the cap it evicts entries without a live ratchet first,
+/// then oldest-ratchet entries. Evicted keys re-learn from the next announce.
+const KNOWN_IDENTITIES_SOFT_CAP: usize = 10_000;
+
+fn prune_known_identities(
+    known_identities: &mut HashMap<String, [u8; 64]>,
+    received_ratchets: &HashMap<String, ReceivedRatchet>,
+) -> usize {
+    if known_identities.len() <= KNOWN_IDENTITIES_SOFT_CAP {
+        return 0;
+    }
+    let mut excess = known_identities.len() - KNOWN_IDENTITIES_SOFT_CAP;
+    let before = known_identities.len();
+
+    let no_ratchet: Vec<String> = known_identities
+        .keys()
+        .filter(|k| !received_ratchets.contains_key(*k))
+        .take(excess)
+        .cloned()
+        .collect();
+    for k in &no_ratchet {
+        known_identities.remove(k);
+    }
+    excess = known_identities.len().saturating_sub(KNOWN_IDENTITIES_SOFT_CAP);
+
+    if excess > 0 {
+        let mut by_age: Vec<(String, f64)> = known_identities
+            .keys()
+            .filter_map(|k| received_ratchets.get(k).map(|rr| (k.clone(), rr.received_at)))
+            .collect();
+        by_age.sort_by(|a, b| a.1.total_cmp(&b.1));
+        for (k, _) in by_age.into_iter().take(excess) {
+            known_identities.remove(&k);
+        }
+    }
+    before - known_identities.len()
+}
+
 fn send_propagation_announce_try(
     tx: &mpsc::Sender<TransportMessage>,
     identity: &Identity,
@@ -1541,11 +1581,14 @@ impl LxmdRunner {
         if now - self.last_ratchet_clean > 900.0 {
             let mem_dropped = purge_expired_ratchets_in_memory(&mut self.received_ratchets);
             let disk_dropped = clean_received_ratchets_dir(&self.received_ratchets_dir);
-            if mem_dropped > 0 || disk_dropped > 0 {
+            let ids_dropped =
+                prune_known_identities(&mut self.known_identities, &self.received_ratchets);
+            if mem_dropped > 0 || disk_dropped > 0 || ids_dropped > 0 {
                 tracing::debug!(
                     mem_dropped,
                     disk_dropped,
-                    "ratchet cleanup pass: removed expired entries"
+                    ids_dropped,
+                    "crypto cache cleanup pass: removed expired entries"
                 );
             }
             self.last_ratchet_clean = now;
@@ -1624,10 +1667,28 @@ impl LxmdRunner {
                 self.known_identities.insert(dest_hex.clone(), pub_key);
                 tracing::debug!(dest = %dest_hex, "learned identity key from announce");
             }
-            if let Some(ratchet_key) = event.ratchet {
-                self.received_ratchets
-                    .insert(dest_hex.clone(), ReceivedRatchet::new(ratchet_key));
+            // Python Identity._remember_ratchet: persist only the single
+            // changed ratchet, off the daemon loop. Identity keys and the
+            // ring stay on the periodic/shutdown saves.
+            if let Some(ratchet_key) = event.ratchet
+                && self
+                    .received_ratchets
+                    .get(&dest_hex)
+                    .is_none_or(|rr| rr.ratchet_pub != ratchet_key)
+            {
+                let rr = ReceivedRatchet::new(ratchet_key);
+                self.received_ratchets.insert(dest_hex.clone(), rr.clone());
                 tracing::debug!(dest = %dest_hex, "learned ratchet from announce");
+                let path = self
+                    .received_ratchets_dir
+                    .join(format!("{dest_hex}.ratchet"));
+                let dir = self.received_ratchets_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    std::fs::create_dir_all(&dir).ok();
+                    if let Err(e) = rr.save(&path) {
+                        tracing::warn!("Failed to persist received ratchet: {e}");
+                    }
+                });
             }
         }
         seen
@@ -3060,6 +3121,34 @@ pub(crate) async fn main() {
 mod tests {
     use super::*;
     use lxmf_core::constants::DeliveryMethod;
+
+    /// Cap eviction prefers entries without a live ratchet, then oldest
+    /// ratchets; under the cap nothing is touched.
+    #[test]
+    fn prune_known_identities_respects_cap_and_recency() {
+        let mut ids: HashMap<String, [u8; 64]> = HashMap::new();
+        let mut ratchets: HashMap<String, ReceivedRatchet> = HashMap::new();
+        for i in 0..KNOWN_IDENTITIES_SOFT_CAP + 10 {
+            ids.insert(format!("id{i:05}"), [0u8; 64]);
+        }
+        // All but 4 of the overflow have ratchets; two ratchets are older.
+        for (i, key) in ids.keys().cloned().enumerate().collect::<Vec<_>>() {
+            if i >= 4 {
+                let mut rr = ReceivedRatchet::new([1u8; 32]);
+                rr.received_at = if i < 6 { 1.0 } else { 1000.0 };
+                ratchets.insert(key, rr);
+            }
+        }
+
+        let dropped = prune_known_identities(&mut ids, &ratchets);
+        assert_eq!(dropped, 10);
+        assert_eq!(ids.len(), KNOWN_IDENTITIES_SOFT_CAP);
+
+        let mut under: HashMap<String, [u8; 64]> = HashMap::new();
+        under.insert("only".into(), [0u8; 64]);
+        assert_eq!(prune_known_identities(&mut under, &ratchets), 0);
+        assert_eq!(under.len(), 1);
+    }
 
     #[test]
     fn path_request_requeue_sets_path_wait_deadline() {
