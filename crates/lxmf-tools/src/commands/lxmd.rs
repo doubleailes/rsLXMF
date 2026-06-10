@@ -397,12 +397,18 @@ fn prune_known_identities(
     for k in &no_ratchet {
         known_identities.remove(k);
     }
-    excess = known_identities.len().saturating_sub(KNOWN_IDENTITIES_SOFT_CAP);
+    excess = known_identities
+        .len()
+        .saturating_sub(KNOWN_IDENTITIES_SOFT_CAP);
 
     if excess > 0 {
         let mut by_age: Vec<(String, f64)> = known_identities
             .keys()
-            .filter_map(|k| received_ratchets.get(k).map(|rr| (k.clone(), rr.received_at)))
+            .filter_map(|k| {
+                received_ratchets
+                    .get(k)
+                    .map(|rr| (k.clone(), rr.received_at))
+            })
             .collect();
         by_age.sort_by(|a, b| a.1.total_cmp(&b.1));
         for (k, _) in by_age.into_iter().take(excess) {
@@ -1677,7 +1683,7 @@ impl LxmdRunner {
                     .is_none_or(|rr| rr.ratchet_pub != ratchet_key)
             {
                 let rr = ReceivedRatchet::new(ratchet_key);
-                self.received_ratchets.insert(dest_hex.clone(), rr.clone());
+                self.received_ratchets.insert(dest_hex.clone(), rr);
                 tracing::debug!(dest = %dest_hex, "learned ratchet from announce");
                 let path = self
                     .received_ratchets_dir

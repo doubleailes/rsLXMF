@@ -395,10 +395,8 @@ mod tests {
     fn test_different_expand_round_constants() {
         let id = sha256(b"test expand rounds");
         let wb_pn = stamp_workblock(&id, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
-        let wb_peering = stamp_workblock(
-            &id,
-            crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
-        );
+        let wb_peering =
+            stamp_workblock(&id, crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING);
         // Workblocks are prefix-stable per construction; only length differs.
         assert_eq!(wb_pn[..wb_peering.len()], wb_peering[..]);
         assert_eq!(wb_pn.len(), STAMP_WORKBLOCK_EXPAND_ROUNDS_PN * 256);
