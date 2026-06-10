@@ -98,8 +98,10 @@ impl PropagationEntry {
 pub struct PropagationStore {
     entries: HashMap<PropagationTransientId, PropagationEntry>,
     total_size: usize,
-    locally_delivered_ids: HashSet<PropagationTransientId>,
-    locally_processed_ids: HashSet<PropagationTransientId>,
+    /// Dedup caches: transient ID → first-seen Unix time. Age-based retention
+    /// (`MESSAGE_EXPIRY * 6`), persisted with their real timestamps.
+    locally_delivered_ids: HashMap<PropagationTransientId, f64>,
+    locally_processed_ids: HashMap<PropagationTransientId, f64>,
     ignored_destinations: HashSet<[u8; 16]>,
     /// Prioritised destinations receive a 0.1x weight multiplier during culling.
     prioritised_destinations: HashSet<[u8; 16]>,
@@ -256,45 +258,49 @@ impl PropagationStore {
     }
 
     pub fn mark_locally_delivered(&mut self, transient_id: PropagationTransientId) {
-        self.locally_delivered_ids.insert(transient_id);
+        self.locally_delivered_ids
+            .insert(transient_id, crate::now_f64());
     }
 
     pub fn is_locally_delivered(&self, transient_id: &PropagationTransientId) -> bool {
-        self.locally_delivered_ids.contains(transient_id)
+        self.locally_delivered_ids.contains_key(transient_id)
     }
 
     pub fn mark_locally_processed(&mut self, transient_id: PropagationTransientId) {
-        self.locally_processed_ids.insert(transient_id);
+        self.locally_processed_ids
+            .insert(transient_id, crate::now_f64());
     }
 
     pub fn is_locally_processed(&self, transient_id: &PropagationTransientId) -> bool {
-        self.locally_processed_ids.contains(transient_id)
+        self.locally_processed_ids.contains_key(transient_id)
     }
 
-    pub fn locally_delivered_ids(&self) -> &HashSet<PropagationTransientId> {
+    pub fn locally_delivered_ids(&self) -> &HashMap<PropagationTransientId, f64> {
         &self.locally_delivered_ids
     }
 
-    pub fn locally_processed_ids(&self) -> &HashSet<PropagationTransientId> {
+    pub fn locally_processed_ids(&self) -> &HashMap<PropagationTransientId, f64> {
         &self.locally_processed_ids
     }
 
-    pub fn replace_locally_delivered(&mut self, ids: HashSet<PropagationTransientId>) {
+    pub fn replace_locally_delivered(&mut self, ids: HashMap<PropagationTransientId, f64>) {
         self.locally_delivered_ids = ids;
     }
 
-    pub fn replace_locally_processed(&mut self, ids: HashSet<PropagationTransientId>) {
+    pub fn replace_locally_processed(&mut self, ids: HashMap<PropagationTransientId, f64>) {
         self.locally_processed_ids = ids;
     }
 
-    /// Drop cache entries whose transient IDs no longer exist in `entries`
-    /// (i.e. were culled). Python removes them once older than
-    /// MESSAGE_EXPIRY * 6; the caller decides the cutoff here.
-    pub fn clean_transient_caches(&mut self) {
+    /// Age out dedup-cache entries older than `MESSAGE_EXPIRY * 6` (Python
+    /// `LXMRouter.clean_transient_id_caches`, LXMRouter.py:956). Retention is
+    /// purely age-based: entries must outlive their store membership so a
+    /// culled-and-reoffered message is still recognised as already handled.
+    pub fn clean_transient_caches(&mut self, now: f64) {
+        let expiry = crate::constants::MESSAGE_EXPIRY as f64 * 6.0;
         self.locally_delivered_ids
-            .retain(|id| self.entries.contains_key(id));
+            .retain(|_, timestamp| now <= *timestamp + expiry);
         self.locally_processed_ids
-            .retain(|id| self.entries.contains_key(id));
+            .retain(|_, timestamp| now <= *timestamp + expiry);
     }
 
     /// `from_peer` is the peer we received this message from, or `None` if it
@@ -513,6 +519,35 @@ mod tests {
         assert!(!store.is_locally_processed(&transient_id));
         store.mark_locally_processed(transient_id);
         assert!(store.is_locally_processed(&transient_id));
+    }
+
+    /// T1-10: dedup caches are age-based (Python MESSAGE_EXPIRY*6), not keyed
+    /// to store membership — a culled-and-reoffered message must still be
+    /// recognised; entries expire only once their timestamp ages out.
+    #[test]
+    fn test_transient_caches_age_based_retention() {
+        let expiry = crate::constants::MESSAGE_EXPIRY as f64 * 6.0;
+        let mut store = PropagationStore::new();
+        let transient_id = tid(0xAA);
+
+        store.mark_locally_delivered(transient_id);
+        store.mark_locally_processed(transient_id);
+        let stamped_at = *store.locally_delivered_ids().get(&transient_id).unwrap();
+
+        // The entry was never inserted into the store at all — cleaning must
+        // still retain it while it is young (store-cull independence).
+        store.clean_transient_caches(stamped_at + 60.0);
+        assert!(store.is_locally_delivered(&transient_id));
+        assert!(store.is_locally_processed(&transient_id));
+
+        // Still retained just inside the expiry horizon...
+        store.clean_transient_caches(stamped_at + expiry - 1.0);
+        assert!(store.is_locally_delivered(&transient_id));
+
+        // ...and dropped once aged out.
+        store.clean_transient_caches(stamped_at + expiry + 1.0);
+        assert!(!store.is_locally_delivered(&transient_id));
+        assert!(!store.is_locally_processed(&transient_id));
     }
 
     #[test]

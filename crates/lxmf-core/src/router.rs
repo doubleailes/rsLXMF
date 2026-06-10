@@ -3,6 +3,7 @@
 //! Python reference: LXMF/LXMRouter.py. Actor pattern — a single tokio task owns
 //! all mutable state.
 
+use crate::now_f64;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -15,7 +16,6 @@ use crate::peer::LxmPeer;
 use crate::propagation::PropagationStore;
 use crate::stamper;
 use crate::ticket::{Ticket, TicketStore};
-use crate::types::PropagationTransientId;
 
 /// Router configuration.
 ///
@@ -856,18 +856,18 @@ impl LxmRouter {
     }
 
     /// Load persisted runtime state (stamp costs, tickets, dedup sets) from
-    /// `state_dir`. Missing files are treated as empty state.
+    /// `state_dir`. Missing files are treated as empty state. Dedup-cache
+    /// timestamps are restored as persisted so age-based expiry survives
+    /// restarts.
     pub fn load_state(&mut self, state_dir: &std::path::Path) -> std::io::Result<()> {
         use crate::persist;
         self.outbound_stamp_costs = persist::load_stamp_costs(state_dir)?;
         self.ticket_store
             .replace_all(persist::load_tickets(state_dir)?);
-        let delivered = persist::load_local_deliveries(state_dir)?;
-        let processed = persist::load_locally_processed(state_dir)?;
         self.propagation_store
-            .replace_locally_delivered(delivered.keys().copied().collect());
+            .replace_locally_delivered(persist::load_local_deliveries(state_dir)?);
         self.propagation_store
-            .replace_locally_processed(processed.keys().copied().collect());
+            .replace_locally_processed(persist::load_locally_processed(state_dir)?);
         Ok(())
     }
 
@@ -875,29 +875,11 @@ impl LxmRouter {
     /// periodically; each file is written atomically via rename.
     pub fn save_state(&self, state_dir: &std::path::Path) -> std::io::Result<()> {
         use crate::persist;
-        use std::time::{SystemTime, UNIX_EPOCH};
 
         persist::save_stamp_costs(state_dir, &self.outbound_stamp_costs)?;
         persist::save_tickets(state_dir, self.ticket_store.all())?;
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        let delivered: std::collections::HashMap<PropagationTransientId, f64> = self
-            .propagation_store
-            .locally_delivered_ids()
-            .iter()
-            .map(|id| (*id, now))
-            .collect();
-        let processed: std::collections::HashMap<PropagationTransientId, f64> = self
-            .propagation_store
-            .locally_processed_ids()
-            .iter()
-            .map(|id| (*id, now))
-            .collect();
-        persist::save_local_deliveries(state_dir, &delivered)?;
-        persist::save_locally_processed(state_dir, &processed)?;
+        persist::save_local_deliveries(state_dir, self.propagation_store.locally_delivered_ids())?;
+        persist::save_locally_processed(state_dir, self.propagation_store.locally_processed_ids())?;
         Ok(())
     }
 
@@ -1730,7 +1712,7 @@ impl LxmRouter {
     fn run_periodic_jobs(&mut self) {
         // Job cadences match the Python LXMRouter jobloop.
         if self.processing_count.is_multiple_of(JOB_TRANSIENT_INTERVAL) {
-            self.propagation_store.clean_transient_caches();
+            self.propagation_store.clean_transient_caches(now_f64());
         }
         if self.processing_count.is_multiple_of(JOB_STORE_INTERVAL)
             && self.config.propagation_enabled
@@ -1832,13 +1814,6 @@ pub struct NodeStats {
     pub total_peers: usize,
     pub max_peers: usize,
     pub peer_stats: HashMap<[u8; 16], PeerStats>,
-}
-
-fn now_f64() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
 }
 
 #[cfg(test)]
@@ -2406,6 +2381,50 @@ mod tests {
         assert_eq!(r2.get_outbound_ticket(&dest_a), Some([0x01; 16]));
         assert!(r2.propagation_store.is_locally_delivered(&transient_a));
         assert!(r2.propagation_store.is_locally_processed(&transient_a));
+    }
+
+    /// T1-10: persisted dedup timestamps are the REAL first-seen times —
+    /// restored on load (not reset to save-time), so age-based expiry is
+    /// stable across arbitrarily many save/load cycles.
+    #[test]
+    fn test_dedup_cache_timestamps_survive_save_load_cycles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let transient = [0x42; 32];
+
+        let mut router = LxmRouter::new(RouterConfig::default());
+        router.propagation_store.mark_locally_delivered(transient);
+        let original_ts = *router
+            .propagation_store
+            .locally_delivered_ids()
+            .get(&transient)
+            .unwrap();
+
+        // Multiple save/load cycles must not refresh the timestamp.
+        for _ in 0..3 {
+            router.save_state(tmp.path()).unwrap();
+            let mut reloaded = LxmRouter::new(RouterConfig::default());
+            reloaded.load_state(tmp.path()).unwrap();
+            let loaded_ts = *reloaded
+                .propagation_store
+                .locally_delivered_ids()
+                .get(&transient)
+                .unwrap();
+            assert_eq!(loaded_ts, original_ts, "timestamp must survive reload");
+            router = reloaded;
+        }
+        assert_eq!(router.propagation_store.locally_delivered_ids().len(), 1);
+
+        // An aged-out entry is gone after the periodic clean, and stays gone
+        // through persistence (growth bounded).
+        let expiry = crate::constants::MESSAGE_EXPIRY as f64 * 6.0;
+        router
+            .propagation_store
+            .clean_transient_caches(original_ts + expiry + 1.0);
+        assert!(!router.propagation_store.is_locally_delivered(&transient));
+        router.save_state(tmp.path()).unwrap();
+        let mut fresh = LxmRouter::new(RouterConfig::default());
+        fresh.load_state(tmp.path()).unwrap();
+        assert!(fresh.propagation_store.locally_delivered_ids().is_empty());
     }
 
     #[test]

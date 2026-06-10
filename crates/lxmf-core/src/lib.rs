@@ -32,6 +32,14 @@
 //!
 //! [`DiscoveryStamper`]: rns_transport::discovery::DiscoveryStamper
 
+/// Unix time as f64 seconds — Python `time.time()` equivalent.
+pub(crate) fn now_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
 pub mod constants;
 pub mod discovery_stamper;
 pub mod handlers;
