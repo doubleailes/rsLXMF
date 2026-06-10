@@ -99,6 +99,7 @@ pub fn generate_stamp(material: &[u8], cost: u8, expand_rounds: usize) -> Option
     if cost == 0 {
         return Some(([0u8; 32], 0));
     }
+    let started = std::time::Instant::now();
     let max_iterations = stamp_iteration_cap(cost)?;
 
     let workblock = stamp_workblock(material, expand_rounds);
@@ -110,9 +111,18 @@ pub fn generate_stamp(material: &[u8], cost: u8, expand_rounds: usize) -> Option
         let stamp = rand_bytes_from(&mut rng);
         let value = stamp_value_from_base(&base_hasher, &stamp);
         if value >= cost as u32 {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            if elapsed_ms > 250 {
+                tracing::info!(cost, value, elapsed_ms, "stamp generated");
+            }
             return Some((stamp, value));
         }
     }
+    tracing::warn!(
+        cost,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "stamp search exhausted iteration cap"
+    );
     None
 }
 
@@ -238,11 +248,26 @@ pub fn spawn_deferred_stamp(
     DeferredStampHandle,
     tokio::sync::oneshot::Receiver<DeferredStampResult>,
 ) {
+    let handle = tokio::runtime::Handle::current();
+    spawn_deferred_stamp_on(&handle, message_id, cost, expand_rounds)
+}
+
+/// Handle-explicit variant: callable from `spawn_blocking` threads (no
+/// implicit runtime context) — the manager tick runs there.
+pub fn spawn_deferred_stamp_on(
+    runtime: &tokio::runtime::Handle,
+    message_id: [u8; 32],
+    cost: u8,
+    expand_rounds: usize,
+) -> (
+    DeferredStampHandle,
+    tokio::sync::oneshot::Receiver<DeferredStampResult>,
+) {
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = tokio::sync::oneshot::channel();
 
     let cancel_flag = cancel.clone();
-    tokio::task::spawn_blocking(move || {
+    runtime.spawn_blocking(move || {
         if cost == 0 {
             let _ = tx.send(DeferredStampResult::Success {
                 stamp: [0u8; 32],

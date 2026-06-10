@@ -264,6 +264,12 @@ pub struct LxmRouter {
     pub pending_outbound: Vec<LxMessage>,
     /// Messages awaiting deferred stamp generation, keyed by message hash.
     pub pending_deferred_stamps: HashMap<[u8; 32], LxMessage>,
+    /// Captured at construction (or via [`set_runtime_handle`](Self::set_runtime_handle))
+    /// so deferred-stamp PoW can spawn onto the blocking pool even when the
+    /// caller is itself on a `spawn_blocking` thread, where
+    /// `Handle::try_current()` fails. Without it the tick grinds stamps
+    /// inline while holding the manager lock (observed 53 s stall).
+    pub runtime_handle: Option<tokio::runtime::Handle>,
     pub active_deferred_stamp: Option<DeferredStampJob>,
     /// Identities allowed for delivery. An empty list means "all allowed".
     pub allowed: Vec<[u8; 16]>,
@@ -328,6 +334,7 @@ impl LxmRouter {
             config,
             pending_outbound: Vec::new(),
             pending_deferred_stamps: HashMap::new(),
+            runtime_handle: tokio::runtime::Handle::try_current().ok(),
             active_deferred_stamp: None,
             allowed: Vec::new(),
             blocked: Vec::new(),
@@ -450,6 +457,22 @@ impl LxmRouter {
         Ok(())
     }
 
+    /// Queue `message` for off-thread stamp generation; it re-enters
+    /// `pending_outbound` with the stamp attached once the worker finishes.
+    /// Returns the message back when it carries no id to key the job on.
+    pub fn defer_stamp(&mut self, mut message: LxMessage) -> Option<LxMessage> {
+        let id = message.message_id.or(message.hash).or_else(|| {
+            message.compute_hash().ok();
+            message.hash
+        });
+        let Some(message_hash) = id else {
+            return Some(message);
+        };
+        message.state = MessageState::Outbound;
+        self.pending_deferred_stamps.insert(message_hash, message);
+        None
+    }
+
     /// Process deferred outbound message stamp generation.
     ///
     /// Python reference: `LXMRouter.process_deferred_stamps` — LXMRouter.py:2407-2498.
@@ -471,15 +494,26 @@ impl LxmRouter {
             return;
         }
 
-        if tokio::runtime::Handle::try_current().is_ok() {
-            let (handle, rx) =
-                stamper::spawn_deferred_stamp(message_hash, cost, STAMP_WORKBLOCK_EXPAND_ROUNDS);
+        let runtime = tokio::runtime::Handle::try_current()
+            .ok()
+            .or_else(|| self.runtime_handle.clone());
+        if let Some(runtime) = runtime {
+            let (handle, rx) = stamper::spawn_deferred_stamp_on(
+                &runtime,
+                message_hash,
+                cost,
+                STAMP_WORKBLOCK_EXPAND_ROUNDS,
+            );
             self.active_deferred_stamp = Some(DeferredStampJob {
                 message_hash,
                 handle,
                 rx,
             });
         } else if let Some(mut message) = self.pending_deferred_stamps.remove(&message_hash) {
+            tracing::warn!(
+                cost,
+                "no tokio runtime available; generating stamp inline (sync embedder only)"
+            );
             match stamper::generate_stamp(&message_hash, cost, STAMP_WORKBLOCK_EXPAND_ROUNDS) {
                 Some((stamp, value)) => {
                     message.stamp = Some(stamp.to_vec());
@@ -2211,6 +2245,75 @@ mod tests {
         let queued = &router.pending_outbound[0];
         assert_eq!(queued.stamp.as_ref().map(Vec::len), Some(32));
         assert!(queued.stamp_value.unwrap_or(0) >= 1);
+    }
+
+    /// Production shape: the manager tick runs on `spawn_blocking`, where
+    /// `Handle::try_current()` fails. The router's stored handle must still
+    /// spawn the PoW worker instead of grinding inline under the caller.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_stamps_spawn_from_blocking_thread_via_stored_handle() {
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        // Constructed inside the runtime: handle captured.
+        let mut router = LxmRouter::new(RouterConfig::default());
+        assert!(
+            router.runtime_handle.is_some(),
+            "handle captured at construction"
+        );
+        let dest = [0xAA; 16];
+        router.set_stamp_cost(dest, 1);
+
+        let mut msg = LxMessage::new(
+            dest,
+            [0xBB; 16],
+            "defer",
+            "blocking",
+            DeliveryMethod::Direct,
+        );
+        msg.sign(&key).unwrap();
+        let message_id = msg.message_id.unwrap();
+        router.send(msg);
+        assert!(router.pending_deferred_stamps.contains_key(&message_id));
+
+        // Drive entirely from a blocking thread (no implicit runtime).
+        let mut router = tokio::task::spawn_blocking(move || {
+            router.process_deferred_stamps();
+            assert!(
+                router.active_deferred_stamp.is_some(),
+                "must spawn a worker, not grind inline"
+            );
+            router
+        })
+        .await
+        .unwrap();
+
+        for _ in 0..200 {
+            router.process_deferred_stamps();
+            if router.pending_outbound.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(router.pending_outbound.len(), 1);
+        assert_eq!(
+            router.pending_outbound[0].stamp.as_ref().map(Vec::len),
+            Some(32)
+        );
+    }
+
+    /// Delivery-time deferral: a message that reaches the outbound executor
+    /// without a stamp goes back through the deferred queue instead of
+    /// blocking the caller.
+    #[tokio::test]
+    async fn defer_stamp_queues_message_with_id() {
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let mut msg = LxMessage::new([0xAA; 16], [0xBB; 16], "d", "s", DeliveryMethod::Direct);
+        msg.sign(&key).unwrap();
+        msg.stamp_cost = Some(1);
+        let id = msg.message_id.unwrap();
+
+        assert!(router.defer_stamp(msg).is_none());
+        assert!(router.pending_deferred_stamps.contains_key(&id));
     }
 
     #[tokio::test]
