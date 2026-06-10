@@ -716,7 +716,6 @@ impl LxmdRunner {
             let link_identities = prop_link_mgr.link_identities_handle();
             let local_identity_hash = identity.hash;
             prop_link_mgr.set_request_handler(move |link_id, path_hash, data| {
-                let mut node = pn_for_handler.lock().ok()?;
                 let remote_identity_hash = link_identities
                     .lock()
                     .ok()
@@ -734,15 +733,21 @@ impl LxmdRunner {
                     lxmf_core::handlers::PropagationRequestHandler::new(local_identity_hash);
                 if path_hash == offer_path_hash {
                     tracing::info!("propagation: handling offer request");
+                    let mut node = pn_for_handler.lock().ok()?;
                     Some(handler.handle_offer_request(remote_identity_ref, &data, &mut node))
                 } else if path_hash == get_path_hash {
                     tracing::info!("propagation: handling get request");
-                    Some(handler.handle_message_get_request(
-                        remote_identity_ref,
-                        &client_dest_hash,
-                        &data,
-                        &mut node,
-                    ))
+                    let action = {
+                        let mut node = pn_for_handler.lock().ok()?;
+                        handler.handle_message_get_request(
+                            remote_identity_ref,
+                            &client_dest_hash,
+                            &data,
+                            &mut node,
+                        )
+                    };
+                    // Phase-2 file reads happen here, after the node lock drops.
+                    Some(action.into_response())
                 } else {
                     tracing::debug!(
                         path = hex::encode(path_hash),
@@ -1435,39 +1440,39 @@ impl LxmdRunner {
         self.drain_backchannel_events();
 
         self.router.process_deferred_stamps();
-        let known_identities = self
-            .known_identities
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>();
-        let route_hops = self.route_hops.clone();
-        let direct_destinations = self
+        // Per-destination plan inputs precomputed for pending Direct messages
+        // only — avoids cloning route_hops/known_identities every tick.
+        let direct_inputs = self
             .router
             .pending_outbound
             .iter()
             .filter(|message| message.method == DeliveryMethod::Direct)
             .map(|message| message.destination_hash)
-            .collect::<HashSet<_>>();
-        let reusable_links = direct_destinations
-            .iter()
-            .copied()
+            .collect::<HashSet<_>>()
+            .into_iter()
             .map(|dest| {
                 (
                     dest,
-                    direct_reusable_link_state(self.link_delivery.as_ref(), dest),
+                    DirectDeliveryPlanInput {
+                        identity_known: self.known_identities.contains_key(&hex::encode(dest)),
+                        route: direct_route_snapshot(&self.route_hops, dest),
+                        reusable_link: direct_reusable_link_state(
+                            self.link_delivery.as_ref(),
+                            dest,
+                        ),
+                    },
                 )
             })
             .collect::<HashMap<_, _>>();
         let actions = self.router.process_outbound_with_direct(|message, _now| {
-            let dest = message.destination_hash;
-            DirectDeliveryPlanInput {
-                identity_known: known_identities.contains(&hex::encode(dest)),
-                route: direct_route_snapshot(&route_hops, dest),
-                reusable_link: reusable_links
-                    .get(&dest)
-                    .copied()
-                    .unwrap_or(DirectReusableLinkState::None),
-            }
+            direct_inputs
+                .get(&message.destination_hash)
+                .cloned()
+                .unwrap_or(DirectDeliveryPlanInput {
+                    identity_known: false,
+                    route: None,
+                    reusable_link: DirectReusableLinkState::None,
+                })
         });
         if !actions.is_empty() {
             self.execute_encrypted_actions(actions);

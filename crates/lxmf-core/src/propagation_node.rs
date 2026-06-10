@@ -49,6 +49,98 @@ pub struct OfferRequestContext<'a> {
     pub remote_identity_hash: Option<&'a [u8; 16]>,
 }
 
+/// Outcome of [`PropagationNode::handle_get_request`]. Phases 1/3 (and
+/// malformed input) are answered from the store alone; phase 2 returns a
+/// read plan so the embedder performs blocking file I/O after releasing
+/// the node lock.
+#[derive(Debug)]
+pub enum GetRequestAction {
+    Respond(Vec<u8>),
+    ServeFiles(GetServePlan),
+}
+
+impl GetRequestAction {
+    /// Resolve to response bytes, performing any planned file reads inline.
+    /// Blocking; do not call while holding a shared node lock.
+    pub fn into_response(self) -> Vec<u8> {
+        match self {
+            GetRequestAction::Respond(bytes) => bytes,
+            GetRequestAction::ServeFiles(plan) => plan.serve(),
+        }
+    }
+}
+
+/// Phase-2 read plan: wants resolved and ownership-gated under the node
+/// lock; [`GetServePlan::serve`] does the file reads outside it.
+#[derive(Debug)]
+pub struct GetServePlan {
+    reads: Vec<PlannedRead>,
+    /// Client transfer limit in bytes (wire value is kB ×1000, Python parity).
+    limit_bytes: Option<f64>,
+}
+
+#[derive(Debug)]
+struct PlannedRead {
+    path: PathBuf,
+    stamped: bool,
+}
+
+impl GetServePlan {
+    /// Read planned files and encode the phase-2 response. Mirrors Python
+    /// LXMRouter.message_get_request limit accounting (LXMRouter.py:1477-1494):
+    /// 24-byte base + 16 bytes per message, full stored size counted,
+    /// over-limit entries skipped (not a transfer abort), stamps stripped
+    /// for client download. Unreadable files are skipped.
+    pub fn serve(&self) -> Vec<u8> {
+        use rmpv::Value;
+
+        const PER_MESSAGE_OVERHEAD: f64 = 16.0;
+        let mut cumulative_size: f64 = 24.0;
+        let mut messages: Vec<Value> = Vec::new();
+
+        for read in &self.reads {
+            let Ok(data) = std::fs::read(&read.path) else {
+                continue;
+            };
+            let next_size = cumulative_size + data.len() as f64 + PER_MESSAGE_OVERHEAD;
+            if self.limit_bytes.is_some_and(|limit| next_size > limit) {
+                continue;
+            }
+            cumulative_size = next_size;
+            let payload = if read.stamped && data.len() >= 32 {
+                data[..data.len() - 32].to_vec()
+            } else {
+                data
+            };
+            messages.push(Value::Binary(payload));
+        }
+
+        crate::encode_value(&Value::Array(messages))
+    }
+}
+
+/// One pending store-file read produced by
+/// [`PropagationNode::plan_message_reads`].
+#[derive(Debug)]
+pub struct PlannedMessageRead {
+    pub transient_id: PropagationTransientId,
+    pub path: PathBuf,
+}
+
+/// Blocking reads for a plan from [`PropagationNode::plan_message_reads`];
+/// call without holding the node lock. Missing/unreadable files are skipped.
+pub fn read_planned_messages(
+    plan: &[PlannedMessageRead],
+) -> Vec<(PropagationTransientId, Vec<u8>)> {
+    plan.iter()
+        .filter_map(|read| {
+            std::fs::read(&read.path)
+                .ok()
+                .map(|data| (read.transient_id, data))
+        })
+        .collect()
+}
+
 pub struct PropagationNode {
     config: PropagationNodeConfig,
     store: PropagationStore,
@@ -644,36 +736,30 @@ impl PropagationNode {
     }
 
     /// Handle a Link REQUEST at the `/get` path for client download. Python
-    /// reference: LXMRouter.message_get_request() (LXMRouter.py:484-587).
+    /// reference: LXMRouter.message_get_request() (LXMRouter.py:1425-1499).
     ///
     /// Wire format is msgpack `[wants, haves]` or `[wants, haves, delivery_limit]`:
-    /// - Phase 1 (list): `[None, None]` -> available transient IDs for the client.
-    /// - Phase 2 (get):  `[[wants...], [haves...]]` -> message payloads; haves
-    ///   are purged in the same call.
+    /// - Phase 1 (list): `[None, None]` -> available transient IDs for the client,
+    ///   smallest message first (Python sorts by file size ascending).
+    /// - Phase 2 (get):  `[[wants...], [haves...]]` -> haves are purged first
+    ///   (Python order), then wants resolve to a [`GetServePlan`] whose file
+    ///   reads the embedder performs without holding the node lock.
     /// - Phase 3 (purge): `[None, [received_ids...]]` -> delete from store.
     pub fn handle_get_request(
         &mut self,
         request_data: &[u8],
         client_dest_hash: &[u8; 16],
-    ) -> Vec<u8> {
+    ) -> GetRequestAction {
         use rmpv::Value;
 
         let value: rmpv::Value = match rmpv::decode::read_value(&mut &request_data[..]) {
             Ok(v) => v,
-            Err(_) => {
-                let mut buf = Vec::new();
-                rmpv::encode::write_value(&mut buf, &Value::Nil).ok();
-                return buf;
-            }
+            Err(_) => return GetRequestAction::Respond(crate::encode_value(&Value::Nil)),
         };
 
         let arr = match value.as_array() {
             Some(a) if a.len() >= 2 => a,
-            _ => {
-                let mut buf = Vec::new();
-                rmpv::encode::write_value(&mut buf, &Value::Nil).ok();
-                return buf;
-            }
+            _ => return GetRequestAction::Respond(crate::encode_value(&Value::Nil)),
         };
 
         let wants_is_nil = arr[0].is_nil();
@@ -692,16 +778,17 @@ impl PropagationNode {
         }
 
         if wants_is_nil && haves_is_nil {
-            // Phase 1: list available messages for this client.
-            let available = self.store.entries_for_destination(client_dest_hash);
+            // Phase 1: list available messages for this client, smallest first.
+            let mut available = self.store.entries_for_destination(client_dest_hash);
+            available.sort_by_key(|e| e.size);
             let id_list: Vec<Value> = available
                 .iter()
                 .map(|e| Value::Binary(e.transient_id.to_vec()))
                 .collect();
-            let response = Value::Array(id_list);
-            crate::encode_value(&response)
+            GetRequestAction::Respond(crate::encode_value(&Value::Array(id_list)))
         } else if wants_is_nil && !haves_is_nil {
-            // Phase 3: purge messages the client already received.
+            // Phase 3: purge messages the client already received. Python
+            // returns the (empty) response_messages list here.
             if let Some(haves_arr) = arr[1].as_array() {
                 for have_val in haves_arr {
                     if let Some(tid) = parse_store_id(have_val) {
@@ -709,18 +796,21 @@ impl PropagationNode {
                     }
                 }
             }
-            crate::encode_value(&Value::Boolean(true))
+            GetRequestAction::Respond(crate::encode_value(&Value::Array(Vec::new())))
         } else {
-            // Phase 2: return requested message data.
-            let mut messages: Vec<Value> = Vec::new();
+            // Phase 2: purge haves first (Python order — an ID in both wants
+            // and haves is purged, not served), then resolve wants into a
+            // read plan executed after the node lock is released.
+            if let Some(haves_arr) = arr[1].as_array() {
+                for have_val in haves_arr {
+                    if let Some(tid) = parse_store_id(have_val) {
+                        self.purge_client_entry(&tid, client_dest_hash);
+                    }
+                }
+            }
 
+            let mut reads = Vec::new();
             if let Some(wants_arr) = arr[0].as_array() {
-                let delivery_limit = if arr.len() > 2 { arr[2].as_f64() } else { None };
-                let limit_bytes = delivery_limit
-                    .map(|kb| (kb * 1024.0) as usize)
-                    .unwrap_or(usize::MAX);
-                let mut total_sent = 0usize;
-
                 for want_val in wants_arr {
                     if let Some(tid) = parse_store_id(want_val)
                         && let Some(ref dir) = self.storage_path
@@ -729,34 +819,22 @@ impl PropagationNode {
                         // may only download messages addressed to itself.
                         && entry.destination_hash == *client_dest_hash
                     {
-                        let path = dir.join(entry.filename());
-                        if let Ok(data) = std::fs::read(&path) {
-                            if total_sent + data.len() > limit_bytes {
-                                break;
-                            }
-                            total_sent += data.len();
-                            let response_data = if entry.stamped && data.len() >= 32 {
-                                data[..data.len() - 32].to_vec()
-                            } else {
-                                data
-                            };
-                            messages.push(Value::Binary(response_data));
-                        }
+                        reads.push(PlannedRead {
+                            path: dir.join(entry.filename()),
+                            stamped: entry.stamped,
+                        });
                     }
                 }
             }
 
-            // Purge haves in the same call.
-            if let Some(haves_arr) = arr[1].as_array() {
-                for have_val in haves_arr {
-                    if let Some(tid) = parse_store_id(have_val) {
-                        self.purge_client_entry(&tid, client_dest_hash);
-                    }
-                }
-            }
+            // Wire value is kilobytes ×1000 (Python LXMRouter.py:1471).
+            let limit_bytes = if arr.len() > 2 {
+                arr[2].as_f64().map(|kb| kb * 1000.0)
+            } else {
+                None
+            };
 
-            let response = Value::Array(messages);
-            crate::encode_value(&response)
+            GetRequestAction::ServeFiles(GetServePlan { reads, limit_bytes })
         }
     }
 
@@ -779,28 +857,38 @@ impl PropagationNode {
         }
     }
 
-    /// Fetch raw packed message data for each requested transient ID. Python
-    /// reference: LXMRouter.message_get_request_received(). Returns an empty
-    /// vec when there is no disk storage configured.
-    pub fn message_get_request(
+    /// Resolve requested transient IDs into store-file read plans (no I/O).
+    /// Perform the reads via [`read_planned_messages`] after releasing the
+    /// node lock. Returns an empty vec when there is no disk storage.
+    pub fn plan_message_reads(
         &self,
         requested_ids: &[PropagationTransientId],
-    ) -> Vec<(PropagationTransientId, Vec<u8>)> {
+    ) -> Vec<PlannedMessageRead> {
         let dir = match &self.storage_path {
             Some(d) => d,
             None => return Vec::new(),
         };
 
-        let mut results = Vec::new();
-        for tid in requested_ids {
-            if let Some(entry) = self.store.get(tid) {
-                let path = dir.join(entry.filename());
-                if let Ok(data) = std::fs::read(&path) {
-                    results.push((*tid, data));
-                }
-            }
-        }
-        results
+        requested_ids
+            .iter()
+            .filter_map(|tid| {
+                self.store.get(tid).map(|entry| PlannedMessageRead {
+                    transient_id: *tid,
+                    path: dir.join(entry.filename()),
+                })
+            })
+            .collect()
+    }
+
+    /// Fetch raw packed message data for each requested transient ID. Python
+    /// reference: LXMRouter.message_get_request_received(). Blocking
+    /// convenience over [`Self::plan_message_reads`] — prefer the staged pair
+    /// when the node sits behind a shared lock.
+    pub fn message_get_request(
+        &self,
+        requested_ids: &[PropagationTransientId],
+    ) -> Vec<(PropagationTransientId, Vec<u8>)> {
+        read_planned_messages(&self.plan_message_reads(requested_ids))
     }
 
     /// Produce a `SyncOffer` listing message IDs the peer has not yet handled.
@@ -843,25 +931,23 @@ impl PropagationNode {
             self.sync_sessions.insert(peer_hash, session);
         }
 
-        let mut messages = Vec::new();
-        for wanted_id_bytes in &get.wanted_ids {
-            if wanted_id_bytes.len() != 32 {
-                continue;
-            }
-            let mut tid = [0u8; 32];
-            tid.copy_from_slice(wanted_id_bytes);
-
-            if let Some(ref dir) = self.storage_path
-                && let Some(entry) = self.store.get(&tid)
-            {
-                let path = dir.join(entry.filename());
-                if let Ok(data) = std::fs::read(&path) {
-                    messages.push(data);
+        let wanted: Vec<PropagationTransientId> = get
+            .wanted_ids
+            .iter()
+            .filter_map(|id_bytes| {
+                if id_bytes.len() != 32 {
+                    return None;
                 }
-            }
-        }
+                let mut tid = [0u8; 32];
+                tid.copy_from_slice(id_bytes);
+                Some(tid)
+            })
+            .collect();
 
-        messages
+        read_planned_messages(&self.plan_message_reads(&wanted))
+            .into_iter()
+            .map(|(_tid, data)| data)
+            .collect()
     }
 
     /// Record a successful transfer for a peer. Loads the peer, adds the
@@ -1168,7 +1254,9 @@ mod tests {
         };
 
         // A requesting B's message gets nothing.
-        let resp = node.handle_get_request(&encode_req(Some(&[tid_b]), Some(&[])), &client_a);
+        let resp = node
+            .handle_get_request(&encode_req(Some(&[tid_b]), Some(&[])), &client_a)
+            .into_response();
         assert_eq!(decode_msgs(&resp), 0);
         assert!(node.store.get(&tid_b).is_some());
 
@@ -1185,7 +1273,9 @@ mod tests {
         );
 
         // A can still fetch its own message...
-        let resp = node.handle_get_request(&encode_req(Some(&[tid_a]), Some(&[])), &client_a);
+        let resp = node
+            .handle_get_request(&encode_req(Some(&[tid_a]), Some(&[])), &client_a)
+            .into_response();
         assert_eq!(decode_msgs(&resp), 1);
 
         // ...and purge it.
@@ -1931,7 +2021,7 @@ mod tests {
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &request).unwrap();
 
-        let response_bytes = node.handle_get_request(&buf, &[0xBB; 16]);
+        let response_bytes = node.handle_get_request(&buf, &[0xBB; 16]).into_response();
         let response: rmpv::Value = rmpv::decode::read_value(&mut &response_bytes[..]).unwrap();
         let arr = response.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -1949,7 +2039,7 @@ mod tests {
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &request).unwrap();
 
-        let response_bytes = node.handle_get_request(&buf, &[0xBB; 16]);
+        let response_bytes = node.handle_get_request(&buf, &[0xBB; 16]).into_response();
         let response: rmpv::Value = rmpv::decode::read_value(&mut &response_bytes[..]).unwrap();
         let arr = response.as_array().unwrap();
         assert!(arr.is_empty());
@@ -1976,7 +2066,9 @@ mod tests {
         let list_request = Value::Array(vec![Value::Nil, Value::Nil]);
         let mut list_buf = Vec::new();
         rmpv::encode::write_value(&mut list_buf, &list_request).unwrap();
-        let list_response = node.handle_get_request(&list_buf, &[0xBB; 16]);
+        let list_response = node
+            .handle_get_request(&list_buf, &[0xBB; 16])
+            .into_response();
         let list_value: Value = rmpv::decode::read_value(&mut &list_response[..]).unwrap();
         assert_eq!(list_value.as_array().unwrap().len(), 1);
 
@@ -1986,7 +2078,9 @@ mod tests {
         ]);
         let mut get_buf = Vec::new();
         rmpv::encode::write_value(&mut get_buf, &get_request).unwrap();
-        let get_response = node.handle_get_request(&get_buf, &[0xBB; 16]);
+        let get_response = node
+            .handle_get_request(&get_buf, &[0xBB; 16])
+            .into_response();
         let get_value: Value = rmpv::decode::read_value(&mut &get_response[..]).unwrap();
         let messages = get_value.as_array().unwrap();
         assert_eq!(messages.len(), 1);
@@ -2027,7 +2121,9 @@ mod tests {
         ]);
         let mut get_buf = Vec::new();
         rmpv::encode::write_value(&mut get_buf, &get_request).unwrap();
-        let get_response = node.handle_get_request(&get_buf, &[0xBB; 16]);
+        let get_response = node
+            .handle_get_request(&get_buf, &[0xBB; 16])
+            .into_response();
         let get_value: Value = rmpv::decode::read_value(&mut &get_response[..]).unwrap();
         let messages = get_value.as_array().unwrap();
         assert_eq!(messages.len(), 1);
@@ -2070,7 +2166,9 @@ mod tests {
         ]);
         let mut get_buf = Vec::new();
         rmpv::encode::write_value(&mut get_buf, &get_request).unwrap();
-        let get_response = reloaded.handle_get_request(&get_buf, &[0xBB; 16]);
+        let get_response = reloaded
+            .handle_get_request(&get_buf, &[0xBB; 16])
+            .into_response();
         let get_value: Value = rmpv::decode::read_value(&mut &get_response[..]).unwrap();
         let messages = get_value.as_array().unwrap();
         assert_eq!(messages.len(), 1);
@@ -2125,7 +2223,9 @@ mod tests {
         let list_request = Value::Array(vec![Value::Nil, Value::Nil]);
         let mut list_buf = Vec::new();
         rmpv::encode::write_value(&mut list_buf, &list_request).unwrap();
-        let response = reloaded.handle_get_request(&list_buf, &[0xBB; 16]);
+        let response = reloaded
+            .handle_get_request(&list_buf, &[0xBB; 16])
+            .into_response();
         let value: Value = rmpv::decode::read_value(&mut &response[..]).unwrap();
         assert_eq!(value.as_array().unwrap().len(), 1);
 
@@ -2157,7 +2257,7 @@ mod tests {
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &request).unwrap();
 
-        let _response_bytes = node.handle_get_request(&buf, &[0xBB; 16]);
+        let _response_bytes = node.handle_get_request(&buf, &[0xBB; 16]).into_response();
         assert_eq!(node.message_count(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2187,11 +2287,197 @@ mod tests {
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &request).unwrap();
 
-        let response_bytes = node.handle_get_request(&buf, &[0xBB; 16]);
+        let response_bytes = node.handle_get_request(&buf, &[0xBB; 16]).into_response();
         let response: rmpv::Value = rmpv::decode::read_value(&mut &response_bytes[..]).unwrap();
         let arr = response.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert!(!arr[0].as_slice().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2-8b: phase 2 must come back as a read plan (file I/O deferred until
+    /// after the node lock is released); phases 1/3 answer immediately.
+    #[test]
+    fn test_get_request_phase2_returns_serve_plan() {
+        use rmpv::Value;
+
+        let dir = std::env::temp_dir().join("lxmf_test_get_serve_plan");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.clone(),
+        )
+        .unwrap();
+
+        let mut blob = vec![0xBB; 16];
+        blob.extend_from_slice(&[0x11; 64]);
+        assert!(node.accept_propagated_blob(&blob, 0));
+        let tid = rns_crypto::sha::full_hash(&blob);
+
+        let list_req = crate::encode_value(&Value::Array(vec![Value::Nil, Value::Nil]));
+        assert!(matches!(
+            node.handle_get_request(&list_req, &[0xBB; 16]),
+            GetRequestAction::Respond(_)
+        ));
+
+        let purge_req = crate::encode_value(&Value::Array(vec![
+            Value::Nil,
+            Value::Array(vec![Value::Binary(vec![0xEE; 32])]),
+        ]));
+        assert!(matches!(
+            node.handle_get_request(&purge_req, &[0xBB; 16]),
+            GetRequestAction::Respond(_)
+        ));
+
+        let get_req = crate::encode_value(&Value::Array(vec![
+            Value::Array(vec![Value::Binary(tid.to_vec())]),
+            Value::Array(vec![]),
+        ]));
+        let action = node.handle_get_request(&get_req, &[0xBB; 16]);
+        let GetRequestAction::ServeFiles(plan) = action else {
+            panic!("phase 2 must return a serve plan");
+        };
+        // Reads resolve after the node borrow ends (embedder drops the lock).
+        drop(node);
+        let response: Value = rmpv::decode::read_value(&mut &plan.serve()[..]).unwrap();
+        let messages = response.as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].as_slice().unwrap(), blob.as_slice());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2-8b parity: haves are purged before wants resolve (Python
+    /// LXMRouter.py:1451-1462) — an ID in both is purged, not served.
+    #[test]
+    fn test_get_phase_purges_haves_before_serving_wants() {
+        use rmpv::Value;
+
+        let dir = std::env::temp_dir().join("lxmf_test_get_purge_first");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.clone(),
+        )
+        .unwrap();
+
+        let mut blob = vec![0xBB; 16];
+        blob.extend_from_slice(&[0x22; 48]);
+        assert!(node.accept_propagated_blob(&blob, 0));
+        let tid = rns_crypto::sha::full_hash(&blob);
+
+        let req = crate::encode_value(&Value::Array(vec![
+            Value::Array(vec![Value::Binary(tid.to_vec())]),
+            Value::Array(vec![Value::Binary(tid.to_vec())]),
+        ]));
+        let response_bytes = node.handle_get_request(&req, &[0xBB; 16]).into_response();
+        let response: Value = rmpv::decode::read_value(&mut &response_bytes[..]).unwrap();
+        assert!(
+            response.as_array().unwrap().is_empty(),
+            "ID in both wants and haves must be purged, not served"
+        );
+        assert_eq!(node.message_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2-8b parity: transfer limit is kB ×1000 with 24-byte base and 16-byte
+    /// per-message overhead, and over-limit entries are skipped rather than
+    /// aborting the serve loop (Python LXMRouter.py:1471-1494).
+    #[test]
+    fn test_get_phase_transfer_limit_python_accounting() {
+        use rmpv::Value;
+
+        let dir = std::env::temp_dir().join("lxmf_test_get_limit_accounting");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.clone(),
+        )
+        .unwrap();
+
+        let make_blob = |fill: u8, total_len: usize| {
+            let mut blob = vec![0xBB; 16];
+            blob.extend(std::iter::repeat_n(fill, total_len - 16));
+            blob
+        };
+        // Cumulative starts at 24, +16 per message: a (100 B) -> 140;
+        // b (350 B) -> 506 > 500 so skipped (would pass a 1024-unit limit of
+        // 512, pinning the ×1000 wire unit); c (50 B) -> 206, still served.
+        let blob_a = make_blob(0x01, 100);
+        let blob_b = make_blob(0x02, 350);
+        let blob_c = make_blob(0x03, 50);
+        for blob in [&blob_a, &blob_b, &blob_c] {
+            assert!(node.accept_propagated_blob(blob, 0));
+        }
+
+        let wants: Vec<Value> = [&blob_a, &blob_b, &blob_c]
+            .iter()
+            .map(|blob| Value::Binary(rns_crypto::sha::full_hash(blob).to_vec()))
+            .collect();
+        let req = crate::encode_value(&Value::Array(vec![
+            Value::Array(wants),
+            Value::Array(vec![]),
+            Value::F64(0.5),
+        ]));
+
+        let response_bytes = node.handle_get_request(&req, &[0xBB; 16]).into_response();
+        let response: Value = rmpv::decode::read_value(&mut &response_bytes[..]).unwrap();
+        let messages = response.as_array().unwrap();
+        assert_eq!(messages.len(), 2, "b is skipped, a and c are served");
+        assert_eq!(messages[0].as_slice().unwrap(), blob_a.as_slice());
+        assert_eq!(messages[1].as_slice().unwrap(), blob_c.as_slice());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2-8b parity: phase-1 listing is sorted smallest message first
+    /// (Python LXMRouter.py:1437-1444).
+    #[test]
+    fn test_get_list_phase_sorted_smallest_first() {
+        use rmpv::Value;
+
+        let dir = std::env::temp_dir().join("lxmf_test_get_list_sorted");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.clone(),
+        )
+        .unwrap();
+
+        let make_blob = |fill: u8, total_len: usize| {
+            let mut blob = vec![0xBB; 16];
+            blob.extend(std::iter::repeat_n(fill, total_len - 16));
+            blob
+        };
+        let blob_large = make_blob(0x04, 300);
+        let blob_small = make_blob(0x05, 100);
+        let blob_mid = make_blob(0x06, 200);
+        for blob in [&blob_large, &blob_small, &blob_mid] {
+            assert!(node.accept_propagated_blob(blob, 0));
+        }
+
+        let list_req = crate::encode_value(&Value::Array(vec![Value::Nil, Value::Nil]));
+        let response_bytes = node
+            .handle_get_request(&list_req, &[0xBB; 16])
+            .into_response();
+        let response: Value = rmpv::decode::read_value(&mut &response_bytes[..]).unwrap();
+        let ids: Vec<Vec<u8>> = response
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_slice().unwrap().to_vec())
+            .collect();
+        let expected: Vec<Vec<u8>> = [&blob_small, &blob_mid, &blob_large]
+            .iter()
+            .map(|blob| rns_crypto::sha::full_hash(blob).to_vec())
+            .collect();
+        assert_eq!(ids, expected);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

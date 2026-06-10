@@ -374,13 +374,15 @@ impl PropagationSyncTask {
     }
 
     fn queue_messages_for_ids(&mut self, ids: &[PropagationTransientId]) {
-        let results = match self.propagation_node.lock() {
-            Ok(node) => node.message_get_request(ids),
+        // Resolve paths under the node lock; read the files after dropping it.
+        let plan = match self.propagation_node.lock() {
+            Ok(node) => node.plan_message_reads(ids),
             Err(_) => {
                 self.state = SyncTaskState::Failed;
                 return;
             }
         };
+        let results = crate::propagation_node::read_planned_messages(&plan);
         self.transfer_queue = results.into_iter().map(|(_tid, data)| data).collect();
 
         if self.transfer_queue.is_empty() {

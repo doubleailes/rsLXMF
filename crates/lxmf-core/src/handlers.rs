@@ -422,7 +422,9 @@ impl PropagationRequestHandler {
         )
     }
 
-    /// Handle a `/get` request from a client downloading messages.
+    /// Handle a `/get` request from a client downloading messages. Phase-2
+    /// responses come back as a [`GetRequestAction::ServeFiles`] plan — the
+    /// embedder resolves it after releasing the node lock.
     ///
     /// Python reference: `LXMRouter.message_get_request` — LXMRouter.py:1425-1499.
     pub fn handle_message_get_request(
@@ -431,14 +433,15 @@ impl PropagationRequestHandler {
         client_dest_hash: &[u8; 16],
         request_data: &[u8],
         node: &mut crate::propagation_node::PropagationNode,
-    ) -> Vec<u8> {
+    ) -> crate::propagation_node::GetRequestAction {
+        use crate::propagation_node::GetRequestAction;
         use rmpv::Value;
 
         let _identity_hash = match remote_identity_hash {
             Some(h) => h,
             None => {
                 let error = Value::from(PeerError::NoIdentity as u64);
-                return crate::encode_value(&error);
+                return GetRequestAction::Respond(crate::encode_value(&error));
             }
         };
 
@@ -979,8 +982,9 @@ mod tests {
             buf
         };
 
-        let response =
-            handler.handle_message_get_request(None, &client_dest, &request_data, &mut node);
+        let response = handler
+            .handle_message_get_request(None, &client_dest, &request_data, &mut node)
+            .into_response();
         let value: rmpv::Value = rmpv::decode::read_value(&mut &response[..]).unwrap();
         assert_eq!(value.as_u64(), Some(PeerError::NoIdentity as u64));
     }
@@ -1004,12 +1008,9 @@ mod tests {
             buf
         };
 
-        let response = handler.handle_message_get_request(
-            Some(&identity),
-            &client_dest,
-            &request_data,
-            &mut node,
-        );
+        let response = handler
+            .handle_message_get_request(Some(&identity), &client_dest, &request_data, &mut node)
+            .into_response();
         let value: rmpv::Value = rmpv::decode::read_value(&mut &response[..]).unwrap();
         let arr = value.as_array().unwrap();
         assert!(arr.is_empty());
