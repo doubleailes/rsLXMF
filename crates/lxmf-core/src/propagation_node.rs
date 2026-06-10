@@ -679,12 +679,8 @@ impl PropagationNode {
             // Phase 3: purge messages the client already received.
             if let Some(haves_arr) = arr[1].as_array() {
                 for have_val in haves_arr {
-                    if let Some(tid) = parse_store_id(have_val)
-                        && let Some(entry) = self.store.remove(&tid)
-                        && let Some(ref dir) = self.storage_path
-                    {
-                        let path = dir.join(entry.filename());
-                        let _ = std::fs::remove_file(&path);
+                    if let Some(tid) = parse_store_id(have_val) {
+                        self.purge_client_entry(&tid, client_dest_hash);
                     }
                 }
             }
@@ -704,6 +700,9 @@ impl PropagationNode {
                     if let Some(tid) = parse_store_id(want_val)
                         && let Some(ref dir) = self.storage_path
                         && let Some(entry) = self.store.get(&tid)
+                        // Ownership gate (Python LXMRouter.py:1479): a client
+                        // may only download messages addressed to itself.
+                        && entry.destination_hash == *client_dest_hash
                     {
                         let path = dir.join(entry.filename());
                         if let Ok(data) = std::fs::read(&path) {
@@ -725,18 +724,33 @@ impl PropagationNode {
             // Purge haves in the same call.
             if let Some(haves_arr) = arr[1].as_array() {
                 for have_val in haves_arr {
-                    if let Some(tid) = parse_store_id(have_val)
-                        && let Some(entry) = self.store.remove(&tid)
-                        && let Some(ref dir) = self.storage_path
-                    {
-                        let path = dir.join(entry.filename());
-                        let _ = std::fs::remove_file(&path);
+                    if let Some(tid) = parse_store_id(have_val) {
+                        self.purge_client_entry(&tid, client_dest_hash);
                     }
                 }
             }
 
             let response = Value::Array(messages);
             crate::encode_value(&response)
+        }
+    }
+
+    /// Remove a store entry on a client's behalf — only when the entry is
+    /// addressed to that client (Python LXMRouter.py:1454 ownership gate);
+    /// foreign transient IDs are ignored.
+    fn purge_client_entry(&mut self, tid: &PropagationTransientId, client_dest_hash: &[u8; 16]) {
+        let owned = self
+            .store
+            .get(tid)
+            .is_some_and(|entry| entry.destination_hash == *client_dest_hash);
+        if !owned {
+            return;
+        }
+        if let Some(entry) = self.store.remove(tid)
+            && let Some(ref dir) = self.storage_path
+        {
+            let path = dir.join(entry.filename());
+            let _ = std::fs::remove_file(&path);
         }
     }
 
@@ -1083,6 +1097,75 @@ mod tests {
         )
         .unwrap();
         assert_eq!(node.message_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T0-1: `/get` ownership gating — a client may only list, download, and
+    /// purge messages addressed to itself (Python LXMRouter.py:1454/1479).
+    #[test]
+    fn test_get_request_ownership_gating() {
+        use rmpv::Value;
+
+        let dir = std::env::temp_dir().join("lxmf_test_get_ownership");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.clone(),
+        )
+        .unwrap();
+
+        let client_a = [0xCC; 16];
+        let client_b = [0xDD; 16];
+        let msg_a = make_signed_message(client_a, [0xBB; 16], "Test", "for A");
+        let msg_b = make_signed_message(client_b, [0xBB; 16], "Test", "for B");
+        assert!(node.accept_message(&msg_a));
+        assert!(node.accept_message(&msg_b));
+
+        let tid_a = node.store.entries_for_destination(&client_a)[0].transient_id;
+        let tid_b = node.store.entries_for_destination(&client_b)[0].transient_id;
+
+        let encode_req = |wants: Option<&[[u8; 32]]>, haves: Option<&[[u8; 32]]>| -> Vec<u8> {
+            let to_val = |ids: Option<&[[u8; 32]]>| match ids {
+                Some(list) => {
+                    Value::Array(list.iter().map(|t| Value::Binary(t.to_vec())).collect())
+                }
+                None => Value::Nil,
+            };
+            crate::encode_value(&Value::Array(vec![to_val(wants), to_val(haves)]))
+        };
+        let decode_msgs = |resp: &[u8]| -> usize {
+            match rmpv::decode::read_value(&mut &resp[..]).unwrap() {
+                Value::Array(items) => items.len(),
+                _ => panic!("expected array response"),
+            }
+        };
+
+        // A requesting B's message gets nothing.
+        let resp = node.handle_get_request(&encode_req(Some(&[tid_b]), Some(&[])), &client_a);
+        assert_eq!(decode_msgs(&resp), 0);
+        assert!(node.store.get(&tid_b).is_some());
+
+        // A's haves cannot purge B's entry (Phase 3).
+        node.handle_get_request(&encode_req(None, Some(&[tid_b])), &client_a);
+        assert!(
+            node.store.get(&tid_b).is_some(),
+            "foreign purge must be ignored"
+        );
+        assert!(
+            dir.join(node.store.get(&tid_b).unwrap().filename())
+                .exists(),
+            "B's file must survive A's purge attempt"
+        );
+
+        // A can still fetch its own message...
+        let resp = node.handle_get_request(&encode_req(Some(&[tid_a]), Some(&[])), &client_a);
+        assert_eq!(decode_msgs(&resp), 1);
+
+        // ...and purge it.
+        node.handle_get_request(&encode_req(None, Some(&[tid_a])), &client_a);
+        assert!(node.store.get(&tid_a).is_none(), "own purge must work");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
