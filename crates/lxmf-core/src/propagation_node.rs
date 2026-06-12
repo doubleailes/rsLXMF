@@ -458,10 +458,14 @@ impl PropagationNode {
         Ok(())
     }
 
-    /// Periodic maintenance: cull expired entries and clean up orphaned files.
+    /// Periodic maintenance: cull expired entries, enforce the storage cap by
+    /// weight (Python `clean_message_store` parity — makes room for new
+    /// messages instead of wedging at the ingest reject), and clean up
+    /// orphaned files.
     pub fn tick(&mut self) {
         let before = self.store.len();
         self.store.cull_expired(self.config.max_message_age);
+        self.store.cull_by_weight(self.config.max_storage);
         let after = self.store.len();
 
         if before > after
@@ -982,7 +986,9 @@ impl PropagationNode {
         let filename = format!("{}.peer", hex_encode(peer_hash));
         let path = dir.join(filename);
         let data = std::fs::read(&path).ok()?;
-        LxmPeer::from_bytes_with_handled(&data)
+        let mut peer = LxmPeer::from_bytes_with_handled(&data)?;
+        self.prune_handled_against_store(&mut peer);
+        Some(peer)
     }
 
     pub fn load_peers(&self) -> Vec<LxmPeer> {
@@ -997,13 +1003,24 @@ impl PropagationNode {
                 let path = entry.path();
                 if path.extension().map(|e| e == "peer").unwrap_or(false)
                     && let Ok(data) = std::fs::read(&path)
-                    && let Some(peer) = LxmPeer::from_bytes_with_handled(&data)
+                    && let Some(mut peer) = LxmPeer::from_bytes_with_handled(&data)
                 {
+                    self.prune_handled_against_store(&mut peer);
                     peers.push(peer);
                 }
             }
         }
         peers
+    }
+
+    /// Drop handled-message IDs whose store entries no longer exist (Python
+    /// `LXMPeer.from_dict` keeps only IDs in `router.propagation_entries`).
+    /// Without this the per-peer sets — and the `.peer` files they round-trip
+    /// through on every sync — grow with total propagated volume forever.
+    /// Files converge lazily: the next `mark_peer_handled` saves the pruned set.
+    fn prune_handled_against_store(&self, peer: &mut LxmPeer) {
+        peer.handled_messages
+            .retain(|id| self.store.contains(id));
     }
 }
 
@@ -1422,24 +1439,59 @@ mod tests {
     }
 
     #[test]
+    fn test_tick_enforces_weight_cap() {
+        let mut node = PropagationNode::new(
+            PropagationNodeConfig {
+                max_storage: 1,
+                ..PropagationNodeConfig::default()
+            },
+            [0xAA; 16],
+        );
+        let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "weight-cull");
+        assert!(
+            node.accept_message(&msg),
+            "ingest cap checks size before insert, first message is admitted"
+        );
+        assert_eq!(node.message_count(), 1);
+        node.tick();
+        assert_eq!(
+            node.message_count(),
+            0,
+            "tick must cull the store down to the weight cap"
+        );
+    }
+
+    #[test]
     fn test_peer_persistence() {
         let dir = std::env::temp_dir().join("lxmf_test_peer_persist");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let node = PropagationNode::with_storage(
+        let mut node = PropagationNode::with_storage(
             PropagationNodeConfig::default(),
             [0xAA; 16],
             dir.clone(),
         )
         .unwrap();
 
+        // Load-time prune (Python LXMPeer.from_dict parity): a handled ID
+        // backed by a live store entry survives; one whose message is gone
+        // from the store is dropped.
+        let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "peer-persist");
+        assert!(node.accept_message(&msg));
+        let live_id = node.create_offer_filtered(&HashSet::new())[0];
+
         let mut peer = LxmPeer::new([0xBB; 16]);
+        peer.add_handled_message(&live_id);
         peer.add_handled_message(&tid(0xCC));
         node.save_peer(&peer).unwrap();
 
         let loaded_peers = node.load_peers();
         assert_eq!(loaded_peers.len(), 1);
-        assert!(loaded_peers[0].has_handled(&tid(0xCC)));
+        assert!(loaded_peers[0].has_handled(&live_id));
+        assert!(
+            !loaded_peers[0].has_handled(&tid(0xCC)),
+            "handled ID without a store entry must be pruned at load"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
