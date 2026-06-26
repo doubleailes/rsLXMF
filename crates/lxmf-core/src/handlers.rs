@@ -37,6 +37,17 @@ pub enum AnnounceResult {
     Rejected(String),
 }
 
+/// Advertised delivery compression support from LXMF delivery-announce app data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionSupport {
+    /// No explicit supported-functionality metadata was present or parseable.
+    Unknown,
+    /// A supported-functionality list was present and omitted `SF_COMPRESSION`.
+    Unsupported,
+    /// A supported-functionality list was present and included `SF_COMPRESSION`.
+    Supported,
+}
+
 /// Parsed propagation-node announce data.
 ///
 /// Wire layout is a 7-element msgpack array:
@@ -257,27 +268,43 @@ pub fn stamp_cost_from_app_data(data: &[u8]) -> Option<u8> {
     parse_announce_app_data(data).and_then(|(_, cost)| cost)
 }
 
+/// Parse advertised `SF_COMPRESSION` support in delivery-announce `app_data`.
+///
+/// Legacy 2-element app_data, malformed data, and missing feature lists are
+/// treated as unknown. A present feature list is authoritative.
+///
+/// Python reference: `compression_support_from_app_data` — LXMF.py:154-164.
+pub fn compression_support_state_from_app_data(data: &[u8]) -> CompressionSupport {
+    let Ok(value) = rmpv::decode::read_value(&mut &data[..]) else {
+        return CompressionSupport::Unknown;
+    };
+    let Some(arr) = value.as_array() else {
+        return CompressionSupport::Unknown;
+    };
+    if arr.len() < 3 {
+        return CompressionSupport::Unknown;
+    }
+    let Some(features) = arr[2].as_array() else {
+        return CompressionSupport::Unknown;
+    };
+
+    if features
+        .iter()
+        .any(|f| f.as_u64() == Some(crate::constants::SF_COMPRESSION as u64))
+    {
+        CompressionSupport::Supported
+    } else {
+        CompressionSupport::Unsupported
+    }
+}
+
 /// Check whether a peer advertises `SF_COMPRESSION` support in its delivery-announce `app_data`.
 ///
 /// Returns `false` for legacy 2-element app_data or when the feature list is missing/empty.
 ///
 /// Python reference: `compression_support_from_app_data` — LXMF.py:154-164.
 pub fn compression_support_from_app_data(data: &[u8]) -> bool {
-    let Ok(value) = rmpv::decode::read_value(&mut &data[..]) else {
-        return false;
-    };
-    let Some(arr) = value.as_array() else {
-        return false;
-    };
-    if arr.len() < 3 {
-        return false;
-    }
-    let Some(features) = arr[2].as_array() else {
-        return false;
-    };
-    features
-        .iter()
-        .any(|f| f.as_u64() == Some(crate::constants::SF_COMPRESSION as u64))
+    compression_support_state_from_app_data(data) == CompressionSupport::Supported
 }
 
 /// Extract the advertised name from propagation-node announce data.
@@ -772,6 +799,10 @@ mod tests {
     #[test]
     fn test_compression_support_from_app_data() {
         let python_096 = get_announce_app_data(Some("Alice"), Some(12));
+        assert_eq!(
+            compression_support_state_from_app_data(&python_096),
+            CompressionSupport::Unknown
+        );
         assert!(!compression_support_from_app_data(&python_096));
 
         let supported = {
@@ -783,7 +814,29 @@ mod tests {
             ]);
             crate::encode_value(&arr)
         };
+        assert_eq!(
+            compression_support_state_from_app_data(&supported),
+            CompressionSupport::Supported
+        );
         assert!(compression_support_from_app_data(&supported));
+
+        let ratspeak_extended_supported = {
+            use rmpv::Value;
+            let arr = Value::Array(vec![
+                Value::Binary(b"Alice".to_vec()),
+                Value::from(12u64),
+                Value::Array(vec![Value::from(crate::constants::SF_COMPRESSION as u64)]),
+                Value::Map(vec![]),
+            ]);
+            crate::encode_value(&arr)
+        };
+        assert_eq!(
+            compression_support_state_from_app_data(&ratspeak_extended_supported),
+            CompressionSupport::Supported
+        );
+        assert!(compression_support_from_app_data(
+            &ratspeak_extended_supported
+        ));
 
         // 3-element form with empty feature list -> unsupported.
         let empty_features = {
@@ -795,7 +848,16 @@ mod tests {
             ]);
             crate::encode_value(&arr)
         };
+        assert_eq!(
+            compression_support_state_from_app_data(&empty_features),
+            CompressionSupport::Unsupported
+        );
         assert!(!compression_support_from_app_data(&empty_features));
+
+        assert_eq!(
+            compression_support_state_from_app_data(&[0xc1]),
+            CompressionSupport::Unknown
+        );
     }
 
     #[test]
